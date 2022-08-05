@@ -9,7 +9,7 @@ Created on Sat May 14 15:31:02 2022
 from torch import nn
 import torch
 from transformers import Wav2Vec2Model,WavLMModel,Wav2Vec2Processor
-from utils import trunc_normal_, freeze_parameters, DropPath
+from tools.utils import trunc_normal_, freeze_parameters, DropPath
 import copy
 from torch.utils import data
 import numpy as np
@@ -155,9 +155,7 @@ class TCN(nn.Module):
         self.hid_chan = hid_chan
         self.kernel_size = kernel_size
         
-        #self.pretrain_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").cuda()
-        #self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-        #self.pretrain_model.freeze_feature_encoder()
+       
 
         layer_norm = GlobLN(in_chan)
         #layer_norm = nn.LayerNorm(401)
@@ -173,10 +171,10 @@ class TCN(nn.Module):
         #self.out = nn.ModuleList()
         #for o in out_chan:
        #     ##Gestisce multitask or intent classification
-        #    out_conv = nn.Linear(bn_chan, n_src * o)
-        #    self.out.append(nn.Sequential(nn.PReLU(), out_conv))
-        #self.classif = ContinualClassifier(bn_chan ,out_chan[0])
-        #self.act = nn.PReLU()
+         #   out_conv = nn.Linear(bn_chan, n_src * o)
+         #   self.out.append(nn.Sequential(nn.PReLU(), out_conv))
+        
+        
 
     # Get activation function.
     def forward(self, mixture_w):
@@ -194,7 +192,7 @@ class TCN(nn.Module):
         #logits = [out(output.mean(-1)) for out in self.out]
         #logits = output.mean(-1)   # LOGITS for TCNwithDytox.
         #logits = self.classif(logits)
-        # logits = self.out(output)
+        
         #return tuple(logits)
         #return logits[0]
         return output
@@ -425,14 +423,14 @@ class ContinualClassifier(nn.Module):
         self.embed_dim = embed_dim
         self.nb_classes = nb_classes
         self.head = nn.Linear(embed_dim, nb_classes, bias=True)
-        #self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
     def reset_parameters(self):
         self.head.reset_parameters()
         self.norm.reset_parameters()
 
     def forward(self, x):
-        #x = self.norm(x)
+        x = self.norm(x)
         return self.head(x)
 
     def add_new_outputs(self, n):
@@ -463,8 +461,8 @@ class DyTox_slu(nn.Module):
     :param nb_TA: The number of transformer blocks (Class_Attention) for the decoder. Default: 1.
     """
     
-    def __init__(self, nb_classes, individual_classifier = '1-1', num_heads = 8, embed_dim = 400, nb_SA=0, nb_TA =1,drop =0.,
-                   drop_path=0., attn_drop=0., mlp_ratio = 4,pretrain_model_name=''):
+    def __init__(self, nb_classes, individual_classifier = '1-1', num_heads = 8, head_div=False,embed_dim = 400, nb_SA=0, nb_TA =1,drop =0.,
+                   drop_path=0., attn_drop=0., mlp_ratio = 4):
         super().__init__()
         
         self.nb_classes = nb_classes
@@ -472,7 +470,8 @@ class DyTox_slu(nn.Module):
         self.individual_classifier = individual_classifier
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
-        self.pretrain_model_name = pretrain_model_name
+        self.head_div = None
+        self.use_div = head_div
         
         
         # Add other pretrained models.
@@ -555,10 +554,17 @@ class DyTox_slu(nn.Module):
         # -----------------------------------------------------------------
         
         
+        if self.use_div:
+            self.head_div = ContinualClassifier(
+                self.embed_dim, self.nb_classes_per_task[-1] + 1
+            ).cuda()
+        
         # Classifier update: ----------------------------------------------
         in_dim, out_dim = self._get_ind_clf_dim()
         
         self.head.append(ContinualClassifier(in_dim, out_dim).cuda())
+        
+        
             
     def freeze(self, names):
         """Choose what to freeze depending on the name of the module."""
@@ -568,11 +574,21 @@ class DyTox_slu(nn.Module):
         self.train()
         
         for name in names:
-            if name == 'old_task_tokens':
+            if name == 'all':
+                self.eval()
+                return freeze_parameters(self)
+            elif name == 'old_task_tokens':
                 freeze_parameters(self.task_tokens[:-1], requires_grad=requires_grad)
             elif name == 'old_heads':
                 self.head[:-1].eval()
                 freeze_parameters(self.head[:-1], requires_grad=requires_grad)
+            
+            elif name == 'tcn':
+                self.encoder.eval()
+                freeze_parameters(self.encoder,requires_grad=requires_grad)
+            
+                
+                
                 
     def _get_ind_clf_dim(self):
         """ Compute the input and output dimensions of the classifier depending on its config.
@@ -710,8 +726,12 @@ class DyTox_slu(nn.Module):
                 final_logits[:, :c] /= len(self.nb_classes_per_task) - i
             logits = final_logits
         
+        
+        if self.head_div is not None:
+            return {'logits': logits, 'div': self.head_div(last_tok_emb),'tokens': tokens_emb}
         #print(f"logits shape: {logits.shape}")
-        return {'logits': logits, 'tokens': tokens_emb}
+        else:
+            return {'logits': logits, 'tokens': tokens_emb}
                 
         
         
@@ -727,11 +747,18 @@ class DyTox_slu(nn.Module):
         
     #     return self.classif(x_proc[:,0])
         
-#if __name__ == "__main__":
+if __name__ == "__main__":
+    #model = WavLMModel.from_pretrained("patrickvonplaten/wavlm-libri-clean-100h-base-plus")
+    #for p in model.parameters():
+    #    p.requires_grad = False
+    #n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    #print(n_parameters)
+    #a = torch.rand(1,)
     
-    #inp = torch.rand(16, 40, 600)
-    #m = TCN(in_chan=40,out_chan = (33,))
-    #o = m(inp)
+    inp = torch.rand(16, 40, 400)
+    m = TCN(in_chan=40,out_chan = (33,))
+    o = m(inp)
+    print(o.shape)
     
     # mode = "test"
     

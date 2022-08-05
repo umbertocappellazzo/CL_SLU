@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Thu Jun 23 13:27:31 2022
+Created on Wed Jul 13 14:16:47 2022
 
 @author: umbertocappellazzo
 """
 
 from torch import nn
 import torch
-#from transformers import Wav2Vec2Model,WavLMModel,Wav2Vec2Processor
-from utils.utils import trunc_normal_, freeze_parameters, DropPath
+from transformers import Wav2Vec2Model,WavLMModel,Wav2Vec2Processor
+from tools.utils import trunc_normal_, freeze_parameters, DropPath
 import copy
 from torch.utils import data
 import numpy as np
@@ -18,7 +18,7 @@ import librosa
 import os
 from scipy import signal
 import torch.optim as optim
-
+import math
 
 class fsc_data(data.Dataset):
     def __init__(self, csvfilename, max_len=64000, win_len=0.02, signaltype='wavscut'):
@@ -155,9 +155,10 @@ class TCN(nn.Module):
         self.hid_chan = hid_chan
         self.kernel_size = kernel_size
         
-        
+       
 
         layer_norm = GlobLN(in_chan)
+        #layer_norm = nn.LayerNorm(401)
         bottleneck_conv = nn.Conv1d(in_chan, bn_chan, 1)
         self.bottleneck = nn.Sequential(layer_norm, bottleneck_conv)
         # Succession of Conv1DBlock with exponentially increasing dilation.
@@ -170,9 +171,9 @@ class TCN(nn.Module):
         #self.out = nn.ModuleList()
         #for o in out_chan:
        #     ##Gestisce multitask or intent classification
-        #    out_conv = nn.Linear(bn_chan, n_src * o)
-        #    self.out.append(nn.Sequential(nn.PReLU(), out_conv))
-
+         #   out_conv = nn.Linear(bn_chan, n_src * o)
+         #   self.out.append(nn.Sequential(nn.PReLU(), out_conv))
+        
         
 
     # Get activation function.
@@ -189,19 +190,19 @@ class TCN(nn.Module):
 
         ###provare max pool2D su ouput seguito de reshape .view(-1,1)
         #logits = [out(output.mean(-1)) for out in self.out]
-        logits = output.mean(-1)   # LOGITS for TCNwithDytox.
+        #logits = output.mean(-1)   # LOGITS for TCNwithDytox.
+        #logits = self.classif(logits)
         
-        # logits = self.out(output)
         #return tuple(logits)
         #return logits[0]
-        #return output
-        return logits   # Used for standard TCN Brutti.
+        return output
+        #return logits   # Used for standard TCN Brutti.
         
     def update(self,new_classes):
         new_head = nn.Linear(self.bn_chan,self.out[0][1].out_features+new_classes)
         new_head.weight.data[:-new_classes] = self.out[0][1].weight.data
         
-        #new_head.cuda()
+        new_head.cuda()
         
         self.out[0][1] = new_head
         
@@ -229,7 +230,7 @@ class ClassAttention(nn.Module):
         self.proj = fc(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
-        #self.apply(self._init_weights)
+        self.apply(self._init_weights)
         
     def reset_parameters(self):
         self.apply(self.init_weights)
@@ -269,6 +270,111 @@ class ClassAttention(nn.Module):
         
         return x_cls, attn, v
     
+
+
+
+
+class GPSA(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 locality_strength=1., use_local_init=True, fc=None):
+        super().__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qk = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.pos_proj = nn.Linear(3, num_heads)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.locality_strength = locality_strength
+        self.gating_param = nn.Parameter(torch.ones(self.num_heads))
+        self.apply(self._init_weights)
+        if use_local_init:
+            self.local_init(locality_strength=locality_strength)
+
+    def reset_parameters(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        if not hasattr(self, 'rel_indices') or self.rel_indices.size(1)!=N:
+            self.get_rel_indices(N)
+
+        attn = self.get_attention(x)
+        v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn, v
+
+    def get_attention(self, x):
+        B, N, C = x.shape
+        qk = self.qk(x).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k = qk[0], qk[1]
+        pos_score = self.rel_indices.expand(B, -1, -1,-1)
+        pos_score = self.pos_proj(pos_score).permute(0,3,1,2)
+        patch_score = (q @ k.transpose(-2, -1)) * self.scale
+        patch_score = patch_score.softmax(dim=-1)
+        pos_score = pos_score.softmax(dim=-1)
+
+        gating = self.gating_param.view(1,-1,1,1)
+        attn = (1.-torch.sigmoid(gating)) * patch_score + torch.sigmoid(gating) * pos_score
+        attn /= attn.sum(dim=-1).unsqueeze(-1)
+        attn = self.attn_drop(attn)
+        return attn
+
+    def get_attention_map(self, x, return_map = False):
+
+        attn_map = self.get_attention(x).mean(0) # average over batch
+        distances = self.rel_indices.squeeze()[:,:,-1]**.5
+        dist = torch.einsum('nm,hnm->h', (distances, attn_map))
+        dist /= distances.size(0)
+        if return_map:
+            return dist, attn_map
+        else:
+            return dist
+
+    def local_init(self, locality_strength=1.):
+        self.v.weight.data.copy_(torch.eye(self.dim))
+        locality_distance = 1 #max(1,1/locality_strength**.5)
+
+        kernel_size = int(self.num_heads**.5)
+        center = (kernel_size-1)/2 if kernel_size%2==0 else kernel_size//2
+        for h1 in range(kernel_size):
+            for h2 in range(kernel_size):
+                position = h1+kernel_size*h2
+                self.pos_proj.weight.data[position,2] = -1
+                self.pos_proj.weight.data[position,1] = 2*(h1-center)*locality_distance
+                self.pos_proj.weight.data[position,0] = 2*(h2-center)*locality_distance
+        self.pos_proj.weight.data *= locality_strength
+
+    def get_rel_indices(self, num_patches):
+        img_size = int(num_patches**.5)
+        rel_indices   = torch.zeros(1, num_patches, num_patches, 3)
+        ind = torch.arange(img_size).view(1,-1) - torch.arange(img_size).view(-1, 1)
+        indx = ind.repeat(img_size,img_size)
+        indy = ind.repeat_interleave(img_size,dim=0).repeat_interleave(img_size,dim=1)
+        indd = indx**2 + indy**2
+        rel_indices[:,:,:,2] = indd.unsqueeze(0)
+        rel_indices[:,:,:,1] = indy.unsqueeze(0)
+        rel_indices[:,:,:,0] = indx.unsqueeze(0)
+        device = self.qk.weight.device
+        self.rel_indices = rel_indices.to(device)
+
+
 
 
 class MHSA(nn.Module):
@@ -422,14 +528,16 @@ class ContinualClassifier(nn.Module):
         self.embed_dim = embed_dim
         self.nb_classes = nb_classes
         self.head = nn.Linear(embed_dim, nb_classes, bias=True)
-        #self.norm = nn.LayerNorm(embed_dim)
-
+        self.norm = nn.LayerNorm(embed_dim)
+        #self.drop = nn.Dropout(0.2)
     def reset_parameters(self):
         self.head.reset_parameters()
         self.norm.reset_parameters()
 
     def forward(self, x):
-        #x = self.norm(x)
+        x = self.norm(x)
+        #x = self.head(x)
+        #return self.drop(x)
         return self.head(x)
 
     def add_new_outputs(self, n):
@@ -442,8 +550,43 @@ class ContinualClassifier(nn.Module):
 
 
 
+class PatchEmbed(nn.Module):
+    """ Image to Patch Embedding, from timm
+    """
+    def __init__(self, spectrogram_size=(40,401), patch_size=(5,50),stride_size=(3,35), in_chans=1, embed_dim=400):
+        super().__init__()
+        
+        self.spectrogram_size = spectrogram_size
+        self.patch_size = patch_size
+        self.stride_size = stride_size
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.stride_size)
+        width_out = math.floor((spectrogram_size[0]+ 2*self.proj.padding[0] - self.proj.dilation[0]*(self.proj.kernel_size[0]-1)-1)/(self.proj.stride[0])+1)
+        height_out = math.floor((spectrogram_size[1]+ 2*self.proj.padding[1] - self.proj.dilation[1]*(self.proj.kernel_size[1]-1)-1)/(self.proj.stride[1])+1)
+        
+        self.num_patches = width_out*height_out
+        #self.apply(self._init_weights)
 
-class DyTox_slu(nn.Module):
+    def reset_parameters(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+
+
+
+class DyTox_slu_AST(nn.Module):
     """ DyTox class definition.
     :param nb_classes: The initial # of classes (task 0).
     :param pretrain_model_name: The pretrained model used for extracting the features from the raw
@@ -460,8 +603,8 @@ class DyTox_slu(nn.Module):
     :param nb_TA: The number of transformer blocks (Class_Attention) for the decoder. Default: 1.
     """
     
-    def __init__(self, nb_classes, individual_classifier = '1-1', num_heads = 8, embed_dim = 401, nb_SA=0, nb_TA =1,drop =0.,
-                   drop_path=0., attn_drop=0., mlp_ratio = 4,pretrain_model_name=''):
+    def __init__(self, nb_classes, individual_classifier = '1-1', num_heads = 8, head_div=False,embed_dim = 400, nb_SA=1, nb_TA =1,drop =0.,
+                   drop_path=0., attn_drop=0., mlp_ratio = 4):
         super().__init__()
         
         self.nb_classes = nb_classes
@@ -469,28 +612,31 @@ class DyTox_slu(nn.Module):
         self.individual_classifier = individual_classifier
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
-        #self.pretrain_model_name = pretrain_model_name
+        self.head_div = None
+        self.use_div = head_div
         
         
         # Add other pretrained models.
         #if self.pretrain_model_name == '':
-        #self.pretrain_model = WavLMModel.from_pretrained("patrickvonplaten/wavlm-libri-clean-100h-base-plus")
-        #self.processor = Wav2Vec2Processor.from_pretrained("patrickvonplaten/wavlm-libri-clean-100h-base-plus")
         #    self.pretrain_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
         #    self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
             #self.pretrain_model.freeze_feature_encoder()
-        #for p in self.pretrain_model.parameters():
-        #    p.requires_grad = False
+        #    for p in self.pretrain_model.parameters():
+        #        p.requires_grad = False
             
-        #self.pretrain_model.cuda()
+        #    self.pretrain_model.cuda()
                 
         #self.embed_dim = self.pretrain_model.config.hidden_size
         self.embed_dim = embed_dim
-        self.encoder = TCN(in_chan=40,out_chan = (4,))#.cuda()
+        #self.encoder = TCN(in_chan=40,out_chan = (4,)).cuda()
         #self.task_tokens = nn.ParameterList([trunc_normal_(nn.Parameter(torch.zeros(1, 1, self.embed_dim).cuda()),std=.02)])
         
-        
-        
+        self.patch_embed = PatchEmbed(spectrogram_size=(40,401), patch_size=(5,50),stride_size=(3,35), in_chans=1, embed_dim=self.embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.num_patches = num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim))
+        trunc_normal_(self.pos_embed, std=.02)
+        #self.pos_drop = nn.Dropout(p=0.2)
         
         #1-1 config: one indipendente classifer for each task that receives the embedding from that task token 
         #(default config. in DyTox).
@@ -498,12 +644,12 @@ class DyTox_slu(nn.Module):
         
         #self.head = nn.ModuleList([ContinualClassifier(in_dim, out_dim).cuda()])
         
-        #blocks = []
-        #for layer_index in range(nb_SA):
-        #    block = Block(dim=self.embed_dim, num_heads=self.num_heads,  mlp_ratio=self.mlp_ratio, qkv_bias=False, qk_scale=None, drop=drop, attn_drop=attn_drop,
-        #                 drop_path=drop_path, act_layer=nn.GELU, norm_layer=nn.LayerNorm, attention_type=MHSA,
-        #                 fc=nn.Linear)
-        #    blocks.append(block)
+        blocks = []
+        for layer_index in range(nb_SA):
+            block = Block(dim=self.embed_dim, num_heads=self.num_heads,  mlp_ratio=self.mlp_ratio, qkv_bias=False, qk_scale=None, drop=drop, attn_drop=attn_drop,
+                         drop_path=drop_path, act_layer=nn.GELU, norm_layer=nn.LayerNorm, attention_type=MHSA,
+                         fc=nn.Linear)
+            blocks.append(block)
         
         #for layer_index in range(nb_TA):
         #    block = Block(dim=self.embed_dim, num_heads=self.num_heads,  mlp_ratio=self.mlp_ratio, qkv_bias=False, qk_scale=None, drop=drop, attn_drop=attn_drop,
@@ -511,12 +657,15 @@ class DyTox_slu(nn.Module):
         #                 fc=nn.Linear)
         #    blocks.append(block)
         
-        #blocks = nn.ModuleList(blocks)
+        blocks = nn.ModuleList(blocks)
         
         #self.sabs = blocks[:nb_SA]
         #self.tabs = blocks[-nb_TA:]
-        #self.tabs = blocks         # In case I use transformers as encoder, use the 2 lines of code above.
-            
+        self.sabs = blocks         # In case I use transformers as encoder, use the 2 lines of code above.
+        
+        self.classif = ContinualClassifier(132, sum(self.nb_classes_per_task)).cuda()
+        
+        
         #Definition of the Task-Attention BLOCK: LN1, TA, LN2, MLP.
         #self.norm1 = norm_layer(self.embed_dim)
         #self.class_attention = ClassAttention(self.embed_dim, num_heads=self.num_heads)
@@ -527,7 +676,7 @@ class DyTox_slu(nn.Module):
         #MLP layer inp_dim = out_dim.
         #self.mlp = Mlp(in_features=self.embed_dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, fc=fc)
         
-        self.classif = ContinualClassifier(64, sum(self.nb_classes_per_task))#.cuda()   # 64 is the standard value.
+        #self.classif = ContinualClassifier(768, 4)
         
         
         
@@ -542,10 +691,10 @@ class DyTox_slu(nn.Module):
             
         # Task token update: ----------------------------------------------
         
-        new_task_token = copy.deepcopy(self.task_tokens[-1])
-        trunc_normal_(new_task_token, std=.02)
+        #new_task_token = copy.deepcopy(self.task_tokens[-1])
+        #trunc_normal_(new_task_token, std=.02)
         
-        self.task_tokens.append(new_task_token)
+        #self.task_tokens.append(new_task_token)
         # -----------------------------------------------------------------
         
         # Diversity head update: ------------------------------------------
@@ -554,10 +703,17 @@ class DyTox_slu(nn.Module):
         # -----------------------------------------------------------------
         
         
-        # Classifier update: ----------------------------------------------
-        in_dim, out_dim = self._get_ind_clf_dim()
+        if self.use_div:
+            self.head_div = ContinualClassifier(
+                self.embed_dim, self.nb_classes_per_task[-1] + 1
+            ).cuda()
         
-        self.head.append(ContinualClassifier(in_dim, out_dim))#.cuda())
+        # Classifier update: ----------------------------------------------
+        #in_dim, out_dim = self._get_ind_clf_dim()
+        
+        #self.head.append(ContinualClassifier(in_dim, out_dim).cuda())
+        self.classif.add_new_outputs(nb_new_classes)
+        
             
     def freeze(self, names):
         """Choose what to freeze depending on the name of the module."""
@@ -570,11 +726,18 @@ class DyTox_slu(nn.Module):
             if name == 'all':
                 self.eval()
                 return freeze_parameters(self)
-            if name == 'old_task_tokens':
+            elif name == 'old_task_tokens':
                 freeze_parameters(self.task_tokens[:-1], requires_grad=requires_grad)
             elif name == 'old_heads':
                 self.head[:-1].eval()
                 freeze_parameters(self.head[:-1], requires_grad=requires_grad)
+            
+            elif name == 'tcn':
+                self.encoder.eval()
+                freeze_parameters(self.encoder,requires_grad=requires_grad)
+            
+                
+                
                 
     def _get_ind_clf_dim(self):
         """ Compute the input and output dimensions of the classifier depending on its config.
@@ -637,7 +800,7 @@ class DyTox_slu(nn.Module):
         """ This method compute the task embeddings that will be used by 
         the task classifiers.
         """
-        #B = x.shape[0]    # Batch size
+        B = x.shape[0]    # Batch size
         
         # If I use wav2vec 2.0 encoder.
         
@@ -645,44 +808,49 @@ class DyTox_slu(nn.Module):
         #x_proc = self.pretrain_model(x_proc.squeeze(0).cuda())[0]
         #print(x_proc.shape)
         
+        x = x.unsqueeze(1)
         
-        x_proc = self.encoder(x)#[:,:,:self.embed_dim]   #X_proc would have embed_dim+1 as dimension, but we need embed_dim%num_heads = 0, so I drop the last feature.
-        #print(x_proc.shape)
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        #x = self.pos_drop(x)
+        
+        #x_proc = self.encoder(x)[:,:,:self.embed_dim]   #X_proc would have embed_dim+1 as dimension, but we need embed_dim%num_heads = 0, so I drop the last feature.
         #x_proc = x[:,:,:self.embed_dim]
         
         #s_e, s_a, s_v = [], [], []
         
-        #for blk in self.sabs:
-        #    x_proc, attn, v = blk(x_proc)
+        for blk in self.sabs:
+            x, attn, v = blk(x)
         #    s_e.append(x_proc)
         #    s_a.append(attn)
         #    s_v.append(v)
             
-        
+        return x.mean(-1)
         
         #print(f"input to task attention: {x_proc.shape}")
         
         #tokens_emb = []
-        # attentions = []
+        #attentions = []
         
-        # for task_token in self.task_tokens:
-        #     task_token = task_token.expand(B,-1,-1)
-        #     #print(f"task token shape: {task_token.shape}")
+        #for task_token in self.task_tokens:
+        #    task_token = task_token.expand(B,-1,-1)
+            #print(f"task token shape: {task_token.shape}")
             
-        #     for blk in self.tabs:
+       #     for blk in self.tabs:
                 
-        #         task_token, attn, v = blk(torch.cat((task_token, x_proc), dim=1))
-        #     #print(f"task token shape after att block: {task_token.shape}")
+       #         task_token, attn, v = blk(torch.cat((task_token, x), dim=1))
+            #print(f"task token shape after att block: {task_token.shape}")
             
-        #     attentions.append(attn)
+       #     attentions.append(attn)
             
-        #     tokens_emb.append(task_token[:, 0])
+       #     tokens_emb.append(task_token[:, 0])
         
-        # return tokens_emb,tokens_emb[-1], attentions               
-        #return x_proc.mean(-1)
-        return x_proc
+        #return tokens_emb,tokens_emb[-1], attentions               
+                
         
         
+        
+    #def forward_classifier(self, tokens_emb, last_tok_emb):
     def forward_classifier(self, x):
         """ Once all task embeddings e_1, ..., e_t are extracted, classify.
         Classifier has different modes based on a pattern x-y:
@@ -713,16 +881,20 @@ class DyTox_slu(nn.Module):
         #         final_logits[:, :c] /= len(self.nb_classes_per_task) - i
         #     logits = final_logits
         
+        
+        # if self.head_div is not None:
+        #     return {'logits': logits, 'div': self.head_div(last_tok_emb),'tokens': tokens_emb}
         # #print(f"logits shape: {logits.shape}")
-        # return {'logits': logits, 'tokens': tokens_emb}
+        # else:
+        #     return {'logits': logits, 'tokens': tokens_emb}
                 
         return self.classif(x)
         
     def forward(self, x):
-        tcn_out = self.forward_features(x)
-        return self.forward_classifier(tcn_out)
         #tokens_emb, last_tok_emb, _ = self.forward_features(x)
         #return self.forward_classifier(tokens_emb, last_tok_emb)
+        logits = self.forward_features(x)
+        return self.forward_classifier(logits)
     
     # def forward(self, x): 
         
@@ -732,122 +904,3 @@ class DyTox_slu(nn.Module):
         
     #     return self.classif(x_proc[:,0])
         
-#if __name__ == "__main__":
-    
-    #inp = torch.rand(16, 40, 600)
-    #m = TCN(in_chan=40,out_chan = (33,))
-    #o = m(inp)
-    
-    # mode = "test"
-    
-    # if mode == "test":
-    #     #/Users/umbertocappellazzo/Desktop/PHD
-    #     #/data/cappellazzo/CL_SLU/fluent_speech_commands_dataset/data/train_data.csv
-    #     train_data = fsc_data("/data/cappellazzo/CL_SLU/fluent_speech_commands_dataset/data/train_data.csv", max_len = 64000)
-    #     params = {'batch_size': 100,'shuffle': True,'num_workers':10}
-    #     train_set_generator = data.DataLoader(train_data, **params)
-        
-    #     valid_data = fsc_data("/data/cappellazzo/CL_SLU/fluent_speech_commands_dataset/data/test_data.csv", max_len = 64000)
-    #     params = {'batch_size':100,'shuffle': False,'num_workers':10}
-    #     valid_set_generator = data.DataLoader(valid_data, **params)
-    #     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    #     modelname = "best_model_inverted.pkl"
-        
-    #     model = TCN(in_chan = 40, n_blocks=5, n_repeats=2, out_chan=(31, )).to(device)
-    #     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    #     criterion = torch.nn.CrossEntropyLoss()
-    #     best_accuracy = 0
-        
-    #     intentSet, subIntentSet = train_data.getsets()
-    #     actionSet, objectSet, locationSet = subIntentSet
-        
-    #     for e in range(100):
-    #         for i, d in enumerate(train_set_generator):
-    #             model.train()
-    #             f, l = d
-    
-    #             y = model(f.float().to(device))
-                
-                
-    #             loss = criterion(y[0], l[0].to(device))
-    #             print("Iteration %d in epoch%d--> loss = %f"%(i, e, loss.item()), end='\r')
-    #             loss.backward()
-    #             optimizer.step()
-    #             optimizer.zero_grad()
-    #             if i % 100 == 0:
-                    
-            
-    #                 model.eval()
-    #                 correct = []
-            
-    #                 for j, eval_data in enumerate(valid_set_generator):
-    #                     feat, label = eval_data
-    #                     y_eval = model(feat.float().to(device))
-    #                     pred = torch.argmax(y_eval[0].detach().cpu(), dim=1)
-    #                     intent_pred = pred
-    #                     correct.append((intent_pred == label[0]).float())
-            
-    #                 acc = np.mean(np.hstack(correct))
-    #                 intent_acc = acc
-    #                 iter_acc = '\n iteration %d epoch %d-->' % (i, e)
-    #                 print(iter_acc, acc, best_accuracy)
-    #                 if intent_acc > best_accuracy:
-    #                     improved_accuracy = 'Current accuracy = %f (%f), updating best model' % (intent_acc, best_accuracy)
-    #                     print(improved_accuracy)
-    #                     best_accuracy = intent_acc
-    #                     best_epoch = e
-    #                     torch.save(model.state_dict(), modelname)
-    #     print(f"The best epoch is: {best_epoch}")
-    
-    # else:
-    #     test_data = fsc_data("/data/cappellazzo/CL_SLU/fluent_speech_commands_dataset/data/valid_data.csv", max_len = 64000)
-    #     params = {'batch_size': 100,'shuffle': True,'num_workers':10}
-    #     test_set_generator = data.DataLoader(test_data, **params)
-        
-    #     valid_data = fsc_data("/data/cappellazzo/CL_SLU/fluent_speech_commands_dataset/data/test_data.csv", max_len = 64000)
-    #     params = {'batch_size':100,'shuffle': False,'num_workers':10}
-    #     valid_set_generator = data.DataLoader(valid_data, **params)
-        
-        
-    #     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    #     print('Using device %s' % device)
-        
-    #     model = TCN(in_chan = 40, n_blocks=5, n_repeats=2, out_chan=(31, )).to(device)
-    #     modelname = "best_model_inverted.pkl"
-        
-    #     model.load_state_dict(torch.load(modelname))
-    #     model.eval()
-    #     model.to(device)
-        
-    #     intentSet, subIntentSet = test_data.getsets()
-    #     actionSet, objectSet, locationSet = subIntentSet
-        
-    #     correct_test = []
-        
-    #     for i, d in enumerate(test_set_generator):
-    #         feat, label = d
-    #         print('Iter %d (%d/%d)' % (i, i * 100, len(test_data)), end='\r')
-    #         z_eval = model(feat.float().to(device))
-    #         pred = [torch.max(z.detach().cpu(), dim=1)[1] for z in z_eval]
-    #         pred_test = pred[0]
-    #         correct_test.append(np.array(pred_test == label[0], dtype=float))
-        
-    #     acc_test = (np.mean(np.hstack(correct_test)))
-    #     print("The accuracy on test set is %f" % (acc_test))
-        
-    #     correct_valid = []
-        
-    #     for i, d in enumerate(valid_set_generator):
-            
-    #         print('Iter %d (%d/%d)' % (i, i * 100, len(valid_data)), end='\r')
-    #         feat, label = d
-            
-    #         a_eval = model(feat.float().to(device))
-    #         pred = [torch.max(a.detach().cpu(), dim=1)[1] for a in a_eval]
-            
-    #         pred_test = pred[0]
-            
-    #         correct_valid.append(np.array(pred_test == label[0], dtype=float))
-        
-    #     acc_val = (np.mean(np.hstack(correct_valid)))
-    #     print("The accuracy on the validation set is %f" % (acc_val))

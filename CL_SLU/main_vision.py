@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jun 14 18:16:54 2022
+Created on Sat Jun 25 09:35:09 2022
 
 @author: umbertocappellazzo
 """
+
 
 import copy
 import os
 from torch.utils.data import DataLoader
 from functools import partial
 from torch.optim import Adam, AdamW
-from continuum import ClassIncremental
-from continuum.datasets import FluentSpeech
+#from continuum import ClassIncremental
+#from continuum.datasets import FluentSpeech
 import torch
 from torch.nn import functional as F
 import argparse
 from continuum.metrics import Logger
 import numpy as np
-from Dytox_model import DyTox_slu, TCN
-from utils import trunc, Memory, InfiniteLoader, trunc_new
+#from DyTox_TCNonly import DyTox_slu, TCN
+from tools.DyTox_vision import DyTox_slu, TCN
+from tools.utils import trunc, Memory, InfiniteLoader#, trunc_new, build_dataset
 import time
 import datetime
 import json
@@ -28,6 +30,10 @@ import wandb
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from torch.utils import data
+from continuum import rehearsal
+from tools.datasets import build_dataset
+import random
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DyTox bare-version for SLU (FSC) train and evaluation', add_help=False)
@@ -38,27 +44,29 @@ def get_args_parser():
     parser.add_argument('--download_dataset', default=False, help='whether to download the FSC dataset or not')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type= str, default='cuda', help='device to use for training/testing')
-    
-    
+    parser.add_argument('--data-set', default='CIFAR', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
+                        type=str, help='Image Net dataset path')
+    parser.add_argument('--input-size', default=32, type=int, help='images input size')
+    parser.add_argument('--patch-size', default=4, type=int)
     
     
     # Training/inference parameters.
-    parser.add_argument('--batch_size', type=int, default=80)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=5e-4, help='learning rate (default: 5e-4)')
+    #parser.add_argument('--lr', type=float, default=5e-4, help='learning rate (default: 5e-4)')
     parser.add_argument("--eval_every", type=int, default=1, help="Eval model every X epochs, if None only eval at the task end")
-    parser.add_argument('--epochs', type=int, default=75)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--label_smoothing', type=float, default=0., help='Label smoothing for the CE loss')
-    parser.add_argument('--weight_decay', type=float, default=0.02)
+    #parser.add_argument('--weight_decay', type=float, default=0.000001)
     
     
     parser.add_argument('--output_basedir', default='./checkponts/',
                         help='path where to save, empty for no saving')
     
     # Rehearsal memory
-    parser.add_argument('--memory-size', default=925, type=int,
+    parser.add_argument('--memory_size', default=2000, type=int,
                         help='Total memory size in number of stored (image, label).')
-    parser.add_argument('--fixed-memory', default=False, action='store_true',
+    parser.add_argument('--fixed_memory', default=True, action='store_true',
                         help='Dont fully use memory when no all classes are seen as in Hou et al. 2019')
     parser.add_argument('--rehearsal', default="random",
                         choices=[
@@ -68,63 +76,111 @@ def get_args_parser():
                             'furthest_token', 'furthest_all'
                         ],
                         help='Method to herd sample for rehearsal.')
-    parser.add_argument('--sep-memory', default=False, action='store_true',
+    parser.add_argument('--sep_memory', default=False, action='store_true',
                         help='Dont merge memory w/ task dataset but keep it alongside')
     
     
     parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--output-dir', default='',
+    parser.add_argument('--output_dir', default='',
                         help='Dont use that')
     
+    
+    # Augmentation parameters
+    parser.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
+                        help='Color jitter factor (default: 0.4)')
+    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
+                        help='Use AutoAugment policy. "v0" or "original". " + \
+                             "(default: rand-m9-mstd0.5-inc1)'),
+    parser.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
+    parser.add_argument('--train-interpolation', type=str, default='bicubic',
+                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+
+    parser.add_argument('--repeated-aug', action='store_true')
+    parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
+    parser.set_defaults(repeated_aug=False)
+    
+    
+    parser.add_argument('--reprob', type=float, default=0.0, metavar='PCT',
+                        help='Random erase prob (default: 0.25)')
+    parser.add_argument('--remode', type=str, default='pixel',
+                        help='Random erase mode (default: "pixel")')
+    parser.add_argument('--recount', type=int, default=1,
+                        help='Random erase count (default: 1)')
+    parser.add_argument('--resplit', action='store_true', default=False,
+                        help='Do not random erase first (clean) augmentation split')
+    
+    # * Mixup params
+    parser.add_argument('--mixup', type=float, default=0.0,
+                        help='mixup alpha, mixup enabled if > 0. (default: 0.8)')
+    parser.add_argument('--cutmix', type=float, default=0.0,
+                        help='cutmix alpha, cutmix enabled if > 0. (default: 1.0)')
+    parser.add_argument('--cutmix-minmax', type=float, nargs='+', default=None,
+                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
+    parser.add_argument('--mixup-prob', type=float, default=1.0,
+                        help='Probability of performing mixup or cutmix when either/both is enabled')
+    parser.add_argument('--mixup-switch-prob', type=float, default=0.5,
+                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
+    parser.add_argument('--mixup-mode', type=str, default='batch',
+                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem", "old"')
+
+    
     #Optimizer
-    # parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
-    #                     help='Optimizer (default: "adamw"')
-    # parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
-    #                     help='Optimizer Epsilon (default: 1e-8)')
-    # parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
-    #                     help='Optimizer Betas (default: None, use opt default)')
-    # parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
-    #                     help='Clip gradient norm (default: None, no clipping)')
-    # parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
-    #                     help='SGD momentum (default: 0.9)')
-    # parser.add_argument('--weight-decay', type=float, default=0.05,
-    #                     help='weight decay (default: 0.05)')
+    parser.add_argument('--opt', default='adam', type=str, metavar='OPTIMIZER',
+                        help='Optimizer (default: "adamw"')
+    parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
+                        help='Optimizer Epsilon (default: 1e-8)')
+    parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
+                        help='Optimizer Betas (default: None, use opt default)')
+    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+                        help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--weight-decay', type=float, default=0.000001,
+                        help='weight decay (default: 0.05)')
     
     # Learning rate schedule parameters
-    # parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
-    #                     help='LR scheduler (default: "cosine"')
-    # parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
-    #                     help='learning rate (default: 5e-4)')
-    # parser.add_argument("--incremental-lr", default=None, type=float,
-    #                     help="LR to use for incremental task (t > 0)")
-    # parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
-    #                     help='learning rate noise on/off epoch percentages')
-    # parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
-    #                     help='learning rate noise limit percent (default: 0.67)')
-    # parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
-    #                     help='learning rate noise std-dev (default: 1.0)')
-    # parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
-    #                     help='warmup learning rate (default: 1e-6)')
-    # parser.add_argument('--incremental-warmup-lr', type=float, default=None, metavar='LR',
-    #                     help='warmup learning rate (default: 1e-6) for task T > 0')
-    # parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
-    #                     help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-    # parser.add_argument('--decay-epochs', type=float, default=10, metavar='N',
-    #                     help='epoch interval to decay LR')
-    # parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
-    #                     help='epochs to warmup LR, if scheduler supports')
-    # parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
-    #                     help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
-    # parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
-    #                     help='patience epochs for Plateau LR scheduler (default: 10')
-    # parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
-    #                     help='LR decay rate (default: 0.1)')
+    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+                        help='learning rate (default: 5e-4)')
+    parser.add_argument("--incremental-lr", default=None, type=float,
+                        help="LR to use for incremental task (t > 0)")
+    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                        help='learning rate noise on/off epoch percentages')
+    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                        help='learning rate noise limit percent (default: 0.67)')
+    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                        help='learning rate noise std-dev (default: 1.0)')
+    parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
+                        help='warmup learning rate (default: 1e-6)')
+    parser.add_argument('--incremental-warmup-lr', type=float, default=None, metavar='LR',
+                        help='warmup learning rate (default: 1e-6) for task T > 0')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+    parser.add_argument('--decay-epochs', type=float, default=10, metavar='N',
+                        help='epoch interval to decay LR')
+    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                        help='patience epochs for Plateau LR scheduler (default: 10')
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                        help='LR decay rate (default: 0.1)')
     
     
     # Continual learning parameters.
-    parser.add_argument('--increment', type=int, default=3, help='# of classes per task/experience')
-    parser.add_argument('--initial_increment', type=int, default=4, help='# of classes for the 1st task/experience')
-    parser.add_argument('--nb_tasks', type=int, default=10, help='the scenario number of tasks')
+    #parser.add_argument('--increment', type=int, default=3, help='# of classes per task/experience')
+    #parser.add_argument('--initial_increment', type=int, default=4, help='# of classes for the 1st task/experience')
+    #parser.add_argument('--nb_tasks', type=int, default=10, help='the scenario number of tasks')
+    
+    parser.add_argument("--initial-increment", default=10, type=int,
+                        help="Base number of classes")
+    parser.add_argument("--increment", default=10, type=int,
+                        help="Number of new classes per incremental task")
+    parser.add_argument('--class-order', default= None, type=int, nargs='+',
+                        help='Class ordering, a list of class ids.')
+    
     parser.add_argument('--max_task', type=int, default=None, help='Max task id to train on')
     
     #DyTox model parameters.
@@ -142,6 +198,7 @@ def get_args_parser():
 
 
 def bce_with_logits(x, y):
+    
     return F.binary_cross_entropy_with_logits(
         x,
         torch.eye(x.shape[1])[y].to(y.device)
@@ -149,7 +206,17 @@ def bce_with_logits(x, y):
 
 
 
-def main(args,config):
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+
+def main(args):
+    out_file = open("logs_metrics_DyTox_CL_vision_4%.json", 'w')
+    wandb.init(project="CL FSC (DyTox)", name="DyTox_vision_CL_4_noaugmentationstransform%",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
+    
     print(args)
     
     
@@ -162,17 +229,24 @@ def main(args,config):
     device = torch.device(args.device)
     
     # Fix the seed for reproducibility
-    #seed = args.seed
-    #torch.manual_seed(seed)
-    #np.random.seed(seed)
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    #gen = torch.Generator()
+    #gen.manual_seed(seed)
+    #random.seed(seed)
+    
+    scenario_train, _ = build_dataset(is_train=True, args=args)
+    scenario_val, _ = build_dataset(is_train=False, args=args)
+    
     
     # Create the train and test dataset splits + corresponding CI scenarios. 
-    dataset_train = FluentSpeech(args.data_path,train=True,download=False)
-    dataset_valid = FluentSpeech(args.data_path,train="valid",download=False)
-    dataset_test = FluentSpeech(args.data_path,train=False,download=False)
-    scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
-    scenario_valid = ClassIncremental(dataset_valid,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
-    scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
+    #dataset_train = FluentSpeech(args.data_path,train=True,download=False)
+    #dataset_valid = FluentSpeech(args.data_path,train="valid",download=False)
+    #dataset_test = FluentSpeech(args.data_path,train=False,download=False)
+    #scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
+    #scenario_valid = ClassIncremental(dataset_valid,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
+    #scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
     #scenario_train = ClassIncremental(dataset_train,nb_tasks=1,transformations=[partial(trunc, max_len=args.max_len)])
     #scenario_test = ClassIncremental(dataset_test,nb_tasks=1,transformations=[partial(trunc, max_len=args.max_len)])
     
@@ -182,9 +256,10 @@ def main(args,config):
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     #criterion = torch.nn.CrossEntropyLoss()
     #criterion = bce_with_logits
+    #criterion_test = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     
-    # CE loss with label smoothing
-    #criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    
     
     #USE DISTILLATION HERE:
     #teacher_model = None
@@ -195,14 +270,16 @@ def main(args,config):
         #teacher_model.eval()
     
     # Memory for rehearsal
-    #memory = None
-    #if args.memory_size > 0:
-    #    memory = Memory(
-    #        args.memory_size, scenario_train.nb_classes, args.rehearsal, args.fixed_memory
-    #    )
+    memory = None
+    if args.memory_size > 0:
+        memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= 'random', fixed_memory=True, nb_total_classes=scenario_train.nb_classes)
+        
+        #memory = Memory(
+        #    args.memory_size, scenario_train.nb_classes, args.rehearsal, args.fixed_memory
+        #)
     
     nb_classes = args.initial_increment
-    lr = config.lr
+    lr = args.lr
     
     start_time = time.time()
     
@@ -216,13 +293,14 @@ def main(args,config):
     # Begin of the task loop                                                  #
     #                                                                         #
     ###########################################################################
-    out_file = open("logs_metrics_DyTox_CL_WD_adamW.json", 'w')
+    #out_file = open("logs_metrics_DyTox_CL_fixfreeze_norehear_bce.json", 'w')
     
     #dytox_weightdecay_31classes_valid
-    #wandb.init(project="CL FSC (DyTox)", name="DyTox_CL_WD_adamW",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
+    #wandb.init(project="CL FSC (DyTox)", name="DyToxwithTCN_CL",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
     #wandb.config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size}
     
     for task_id, exp_train in enumerate(scenario_train):
+        
         
         if args.max_task == task_id:
             print("Stop training because of max task")
@@ -239,15 +317,15 @@ def main(args,config):
         # Definition of the model Dytox: if task_id == 0, first initialization; 
         # else, the model must be updated (classifiers + task tokens).
         
-        #loader_memory = None
-        #if task_id > 0 and memory is not None and not args.sep_memory:
+        
+        if task_id > 0 and memory is not None and not args.sep_memory:
             #dataset_memory = memory.get_dataset(dataset_train)
             #data_loader = DataLoader(dataset_memory,batch_size=args.batch_size,num_workers=args.num_workers,pin_memory=True,drop_last=True)
             #loader_memory = InfiniteLoader(data_loader)
             #if not args.sep_memory:
-       #     previous_size = len(exp_train)
-        #    exp_train.add_samples(*memory.get())
-        #    print(f"{len(exp_train) - previous_size} samples added from memory.")
+            previous_size = len(exp_train)
+            exp_train.add_samples(*memory.get())
+            print(f"{len(exp_train) - previous_size} samples added from memory.")
         
         
         if task_id == 0:
@@ -255,35 +333,59 @@ def main(args,config):
             model = DyTox_slu(nb_classes).to(device)
             #model = TCN(in_chan=40,out_chan = (nb_classes,)).cuda()
             n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                        
+            
+            #count = 0
+            #for name, param in model.named_parameters(): 
+                #print(name,param.shape)
+            #    count += param.numel()
+            #    print(count)
+                
+            
             print('number of params of overall DyTox:', n_parameters)
+            #n_parameters_name = sum(q.numel() for p,q in model.named_parameters())
+            #print(n_parameters_name)
+
             #n_parameters = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
             #print('number of params of the TCN:', n_parameters)
         else:
-            if (task_id ==4):
-                break
             print(f'Updating DyTox, {args.increment} new classes + 1 new task token for the {task_id}-th task.')
             model.update_model(args.increment)
+            #model.classif.add_new_outputs(args.increment)
             #model.update(args.increment)   # For TCN
+            
+            #for name, param in model.named_parameters(): 
+            #    print(name,param.shape)
+            
+            
         #wandb.watch(model)
         # Freeze all task tokens and heads/classifiers before the actual task token.
         if task_id > 0:
+            print("Freezing past tokens and heads")
             model.freeze(args.freeze_task)
         #model = TCN(in_chan=40,out_chan = (31,)).cuda()
     # Optimizer definition: a new optimizer for each task since the model is extended by the time we 
     # enter a new task.
         
-        #optimizer = create_optimizer(args, model)
+        optimizer = create_optimizer(args, model)
         
-        #lr_scheduler, _ = create_scheduler(args, optimizer)
+        lr_scheduler, _ = create_scheduler(args, optimizer)
         
-        #optimizer = Adam(model.parameters(), lr=lr,weight_decay=args.weight_decay)
-        optimizer = AdamW(model.parameters(),lr=lr,weight_decay=config.weight_decay)
-        #test_taskset = scenario_test[:task_id+1]    # Evaluation on all seen tasks.
-        train_loader = DataLoader(exp_train, batch_size=args.batch_size,shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-        valid_loader = DataLoader(scenario_valid[:task_id+1], batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-        #test_loader = DataLoader(test_taskset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
         
+        #optimizer = Adam(model.parameters(),lr=lr,weight_decay=args.weight_decay)
+        #optimizer = Adam(filter(lambda p : p.requires_grad, model.parameters()), lr=lr,weight_decay=args.weight_decay)
+        #optimizer = AdamW(filter(lambda p : p.requires_grad, model.parameters()), lr=lr,weight_decay=args.weight_decay)
+        #optimizer = AdamW(model.parameters(),lr=lr,weight_decay=args.weight_decay)
+        test_taskset = scenario_val[:task_id+1]    # Evaluation on all seen tasks.
+        #train_taskset = scenario_train[:task_id+1]
+        #train_loader = DataLoader(train_taskset, batch_size=args.batch_size,shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        #sampler_train = torch.utils.data.RandomSampler(exp_train)
+        train_loader = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        #train_loader = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False,)
+        #valid_loader = DataLoader(scenario_valid[:task_id+1], batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        test_loader = DataLoader(test_taskset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        #train_loader2 = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False,)
+        #train_loader2 = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker, pin_memory=True, drop_last=True,generator=gen)
+        #gen.manual_seed(0)
         #best_accuracy = 0
         
         #num_steps = len(train_loader) *epochs
@@ -298,18 +400,27 @@ def main(args,config):
         print(f"Start training for {epochs} epochs")
         #max_accuracy = 0.0
         for epoch in range(epochs):
+            
+            model.count = 0
             model.train()
             train_loss = 0.
             print(f"Epoch #: {epoch}")
             for x,y,t in train_loader:
+                
+                
                 x = x.to(device)#[0,:].unsqueeze(0)
                 y = y.to(device)#[0,:].unsqueeze(0)
                 #print(x.shape)
                 #print(y.shape)
                 
+                if model.count == 0:
+                    
+                    print(f"Original image : {x[0,0,:4,:4]}")
+                    
+                
                 optimizer.zero_grad()
                 predictions = model(x)['logits']
-                
+                model.count +=1
                 
                 #print(predictions)
                 #print(y[:,0])
@@ -321,11 +432,11 @@ def main(args,config):
                 #print(y[:,0].shape)
                 #print(predictions[:5,:].argmax(dim=1))
                 #print(y[:5,0])
-                loss = criterion(predictions,y[:,0])  #y[:,0]
+                loss = criterion(predictions,y)  #y[:,0]
                 train_loss += loss.item()
                 loss.backward()
                 optimizer.step()
-                #lr_scheduler.step(epoch)
+                lr_scheduler.step(epoch)
                 
                 #with warmup_scheduler.dampening():
                 #    lr_scheduler.step()
@@ -333,7 +444,7 @@ def main(args,config):
                 
                 #print(f"train loss for each batch: {loss.item()}")
                 #break
-                logger.add([predictions.cpu().argmax(dim=1),y[:,0].cpu(),t], subset= 'train')
+                logger.add([predictions.cpu().argmax(dim=1),y.cpu(),t], subset= 'train')
                 
                 #if args.eval_every and (epoch+1) % args.eval_every == 0:
                     
@@ -342,6 +453,13 @@ def main(args,config):
                     #print(predictions)
                     #print(y[:,0])
                 
+            #count2 = 0
+            #for x2,y2,_ in train_loader2:
+                
+            #    if count2 == 0:
+                    
+            #        print(x2[0,0,:4,:4])
+            #        count2 +=1
             
             
             
@@ -357,29 +475,31 @@ def main(args,config):
                 #print(y[:,0])
                 #with torch.inference_mode(): 
                 with torch.no_grad():
-                    for x_valid, y_valid, t_valid in valid_loader:
+                    for x_valid, y_valid, t_valid in test_loader:
                         predic_valid = model(x_valid.cuda())['logits']
                         
-                        test_loss += criterion(predic_valid,y_valid[:,0].cuda()).item()
-                        #print(predic_test[:5,:].argmax(dim=1))
-                        #print(y_test[:5,0])
+                        test_loss += criterion(predic_valid,y_valid.cuda()).item()
+                        #print(predic_valid[:5,:].argmax(dim=1))
+                        #print(y_valid[:5,0])
                         
-                        logger.add([predic_valid.cpu().argmax(dim=1),y_valid[:,0].cpu(),t_valid], subset = 'test')
-                    test_loss /= len(valid_loader)
+                        logger.add([predic_valid.cpu().argmax(dim=1),y_valid.cpu(),t_valid], subset = 'test')
+                    test_loss /= len(test_loader)
                     wandb.log({"train_loss": train_loss, "valid_loss": test_loss,"train_acc": logger.online_accuracy,"valid_acc": logger.accuracy })
                     print(f"Train accuracy: {logger.online_accuracy}")
                     print(f"Valid accuracy: {logger.accuracy}")
                     print(f"Valid loss at epoch {epoch} and task {task_id}: {test_loss}")
-                    
-                    # Code for early stopping.
-                    #if logger.accuracy > best_accuracy:
-                    #    best_accuracy = logger.accuracy
-                    #    best_epoch = epoch
-                    #    best_model = copy.deepcopy(model)
+             
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"The LR of epoch {epoch} for task {task_id} is: {current_lr}")
             
-                        
-        
-                    
+            # CHECK WHETHER TOKENS AND HEADS ARE CORRECTLY FROZEN OR NOT.
+            #for id,tok in enumerate(model.task_tokens):
+                #print(tok.requires_grad)
+            #    print(f"Token of task {id} and epoch {epoch}: {tok[:,:,0:5]}")
+            # for id, heads in enumerate(model.head):
+            #     print(f"Head of task {id} and epoch {epoch}: {heads.head.weight.data[0:1,0:10]}")
+            #     for p in heads.parameters():
+            #         print(p.requires_grad)  
                 
             
             #print(logger.average_incremental_accuracy)
@@ -402,21 +522,7 @@ def main(args,config):
            # "online_cum_perf": round(100*logger.online_cumulative_performance,2),
             logger.end_epoch()
         
-        # Test phase:
-        #correct_test = []
-        #with torch.no_grad():
-        #    for x_test, y_test,t_test in test_loader:
-        #        predic_test = best_model(x_test.to(device))['logits']
-                
-                
-        #        pred = torch.max(predic_test.detach().cpu(), dim=1)
-        #        
-        #        correct_test.append(np.array(pred == y_test[:,0], dtype=float))
         
-        #acc_test = (np.mean(np.hstack(correct_test)))
-        #print(f"The accuracy on the test set is: {acc_test}. The model used has been trained in the validation set at epoch: {best_epoch}")
-        
-        #json.dump({"test_loss": acc_test},out_file,ensure_ascii = False )
 
             
         
@@ -424,20 +530,23 @@ def main(args,config):
         out_file.write('\n')
         
         
-        # if memory is not None:
-        #     task_memory_path = os.path.join(args.resume, f'memory_{task_id}.npz')
-        #     if os.path.isdir(args.resume) and os.path.exists(task_memory_path):
-        #         # Resuming this task step, thus reloading saved memory samples
-        #         # without needing to re-compute them
-        #         memory.load(task_memory_path)
-        #     else:
-        #         memory.add(scenario_train[task_id], model, args.initial_increment if task_id == 0 else args.increment)
-        #         if args.resume != '':
-        #             memory.save(task_memory_path)
-        #         else:
-        #             memory.save(os.path.join(args.output_dir, f'memory_{task_id}.npz'))
-
-        #     assert len(memory) <= args.memory_size
+        if memory is not None:
+            #task_memory_path = os.path.join(args.resume, f'memory_{task_id}.npz')
+            #if os.path.isdir(args.resume) and os.path.exists(task_memory_path):
+                # Resuming this task step, thus reloading saved memory samples
+                # without needing to re-compute them
+                #memory.load(task_memory_path)
+            #else:
+            #    memory.add(scenario_train[task_id], model, args.initial_increment if task_id == 0 else args.increment)
+            #    print(len(memory))
+            #    if args.resume != '':
+            #        memory.save(task_memory_path)
+            #    else:
+            #        memory.save(os.path.join(args.output_dir, f'memory_{task_id}.npz'))
+            memory.add(*scenario_train[task_id].get_raw_samples(),z=None)
+            #print(len(memory))
+            
+            assert len(memory) <= args.memory_size
         
                     
         
@@ -448,8 +557,8 @@ def main(args,config):
         
         
     out_file.write('Parameters: \n')
-    json.dump({"starting lr": config.lr,"epochs": args.epochs, "batch_size": args.batch_size, "initial_increment": args.initial_increment,
-               "optimizer":"AdamW", "label_smoothing":args.label_smoothing, "loss_type": "cross_entropy loss", "weight_decay": config.weight_decay},out_file,ensure_ascii = False )
+    json.dump({"starting lr": args.lr,"epochs": args.epochs, "batch_size": args.batch_size, "initial_increment": args.initial_increment,
+               "optimizer":"Adam", "label_smoothing":args.label_smoothing, "loss_type": "cross_entropy loss", "weight_decay": args.weight_decay},out_file,ensure_ascii = False )
     #torch.save(logger,'logger.pt')   
     
               
@@ -458,7 +567,7 @@ def main(args,config):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-    #wandb.finish()     
+    wandb.finish()     
             
             
             
@@ -470,46 +579,92 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser('DyTox bare-version for SLU (FSC) train and evaluation', parents=[get_args_parser()])
     args = parser.parse_args()
 
+    a = main(args)
+    
+    # seed = 0
+    # torch.manual_seed(0)
+    # np.random.seed(0)
+    # random.seed(0)
+    
+    # scenario_train, _ = build_dataset(is_train=True, args=args)
+    
+    # for task_id, exp_train in enumerate(scenario_train):
+    #     train_loader = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False,)
+    #     train_loader2 = DataLoader(exp_train,batch_size=args.batch_size, shuffle=False,)
+        
+    #     for epoch in range(10):
+            
+    #         count = 0
+            
+    #         for x,y,t in train_loader:
+    #             if count == 0:
+    #                 print(x[0,0,:4,:4])
+                    
+    #                 count +=1
+    #         count2 = 0
+    #         for x2,y2,_ in train_loader2:
+            
+    #             if count2 == 0:
+    #                 print(x2[0,0,:4,:4])
+    #                 count2 +=1
+                
+    
+    
+    
+    
+    
+    
     
     #wandb.init(project="CL FSC (DyTox)", name="DyTox_CL_WD_adamW_sweep_hyperparam",entity="umbertocappellazzo")
     
-    sweep_config = {'method': 'grid'}
+    # sweep_config = {'method': 'grid'}
     
-    parameters_dict = {
-        'weight_decay': {
-            'values': [0.1,0.02,0.05]
-            },
-        'lr': {
-            'values': [5e-4,1e-3,1e-4]
-            },
-        }
+    # parameters_dict = {
+    #     'weight_decay': {
+    #         'values': [0.1,0.02,0.05]
+    #         },
+    #     'lr': {
+    #         'values': [1e-4,5e-4,1e-3]
+    #         },
+    #     }
     
-    sweep_config['parameters'] = parameters_dict
-    parameters_dict.update({
-        'epochs': {
-            'value':75
-            }
-        })    
-    sweep_id = wandb.sweep(sweep_config,entity="umbertocappellazzo",project="CL FSC (DyTox)")
+    # sweep_config['parameters'] = parameters_dict
+    # parameters_dict.update({
+    #     'epochs': {
+    #         'value':75
+    #         }
+    #     })    
+    # sweep_id = wandb.sweep(sweep_config,entity="umbertocappellazzo",project="CL FSC (DyTox)")
     
-    def train(config=None):
-        with wandb.init(config=config):
-            config = wandb.config
-            main(args,config)
+    # def train(config=None):
+    #     with wandb.init(config=config):
+    #         config = wandb.config
+    #         main(args,config)
             
-    wandb.agent(sweep_id,train,entity="umbertocappellazzo",project="CL FSC (DyTox)")
+    # wandb.agent(sweep_id,train,entity="umbertocappellazzo",project="CL FSC (DyTox)")
     
-        
-        
-   # main(args)
     
     #from torchaudio import transforms
     
     
     
     
-    # data_path = '/data/cappellazzo/CL_SLU/' #'/Users/umbertocappellazzo/Desktop/PHD'           
+    #data_path = '/Users/umbertocappellazzo/Desktop/PHD' #'/data/cappellazzo/CL_SLU/' 
+    #dataset = FluentSpeech(data_path,train=True,download=False)
+    #scenario = ClassIncremental(dataset, nb_tasks=31, transformations=[partial(trunc, max_len=64000)])
+    #out_file = open("FSC_class_distribution.json", 'w')
     
+    #for task_id, exp_train in enumerate(scenario):
+        
+    #    train_loader = DataLoader(exp_train, batch_size=1,shuffle=False)
+        
+        #print(scenario.classes)
+    #    print(len(train_loader))
+    #    json.dump({f'Class id: {task_id}, class name: {list(dataset.class_ids.keys())[task_id]}': len(train_loader)},out_file,ensure_ascii = False)
+    #    out_file.write('\n')
+        #if task_id ==2:
+        #    break
+    #out_file.close()  
     
     # mode = "test"
     
