@@ -32,7 +32,7 @@ from timm.scheduler import create_scheduler
 from torch.utils import data
 from continuum import rehearsal
 from tools.datasets import build_dataset
-import random
+#import random
 
 
 def get_args_parser():
