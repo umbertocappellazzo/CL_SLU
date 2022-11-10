@@ -115,7 +115,7 @@ def main(args):
     print(args)
     
     
-    # Create the Continuum logger for tracking and computing the metrics thoughout the training and test phases.
+    # Create the Continuum logger for tracking and computing the metrics throughout the training and test phases.
     
     logger = Logger(list_subsets=['train','test'])
     
