@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Thu Jul 14 08:45:28 2022
+Created on Tue Jul 26 14:30:11 2022
 
 @author: umbertocappellazzo
 """
@@ -20,7 +20,7 @@ from continuum.metrics import Logger
 import numpy as np
 from DyTox_TCNonly import DyTox_slu, TCN
 #from Dytox_model import DyTox_slu, TCN
-from tools.utils import trunc, get_kdloss,get_finetuning_dataset, SpecAugment,collate_batch
+from tools.utils import trunc, get_kdloss,get_finetuning_dataset, SpecAugment,collate_batch,get_kdloss_onlyrehe
 import time
 import datetime
 import json
@@ -32,6 +32,10 @@ from torch.utils import data
 from continuum import rehearsal
 import matplotlib.pyplot as plt
 import librosa
+import quadprog
+from statistics import mean
+import soundfile
+import math
 
 
 def get_args_parser():
@@ -63,7 +67,7 @@ def get_args_parser():
     # Rehearsal memory
     parser.add_argument('--memory_size', default=930, type=int,
                         help='Total memory size in number of stored (image, label).')
-    parser.add_argument('--fixed_memory', default=False, action='store_true',
+    parser.add_argument('--fixed_memory', default=True, action='store_true',
                         help='Dont fully use memory when no all classes are seen as in Hou et al. 2019')
     parser.add_argument('--rehearsal', default="random",
                         choices=[
@@ -173,17 +177,43 @@ def bce_with_logits(x, y):
     )
 
 
+
+
+def solve_quadprog(g,G,memory_strength=0.5):
+        """
+        Solve quadratic programming with current gradient g and
+        gradients matrix on previous tasks G.
+        Taken from original code:
+        https://github.com/facebookresearch/GradientEpisodicMemory/blob/master/model/gem.py
+        """
+
+        memories_np = G.cpu().double().numpy()
+        gradient_np = g.cpu().contiguous().view(-1).double().numpy()
+        t = memories_np.shape[0]
+        P = np.dot(memories_np, memories_np.transpose())
+        P = 0.5 * (P + P.transpose()) + np.eye(t) * 1e-3
+        q = np.dot(memories_np, gradient_np) * -1
+        G = np.eye(t)
+        h = np.zeros(t) + memory_strength
+        v = quadprog.solve_qp(P, q, G, h)[0]
+        v_star = np.dot(v, memories_np) + gradient_np
+
+        return torch.from_numpy(v_star).float()
+    
+
+
+
     
 
 def main(args):
     out_file = open("logs_metrics_DyTox_CL_fixfreeze_norehear_bce.json", 'w')
-    wandb.init(project="CL FSC (DyTox)", name="TCN-only_rehe_fixedmemoryperclass",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
+    wandb.init(project="ICASSP_paper_experiments", name="TCN_GEM_MSE_onlyre_+KD_onlyrehe_930",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
     
     print(args)
     
     
     
-    
+    torch.set_num_threads(10)
     
     # Create the logger for tracking and computing the metrics thoughout the training and test phases.
     logger = Logger(list_subsets=['train','test'])
@@ -191,19 +221,25 @@ def main(args):
     device = torch.device(args.device)
     
     # Fix the seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    #seed = args.seed
+    #torch.manual_seed(seed)
+    #np.random.seed(seed)
+    
+    
+    
+    #class_order = [19, 27, 30, 28, 15,  4,  2,  9, 10, 22, 11,  7,  1, 25, 16, 14,  5,
+    #         8, 29, 12, 21, 17,  3, 20, 23,  6, 18, 24, 26,  0, 13]
+    
     
     # Create the train and test dataset splits + corresponding CI scenarios. 
     dataset_train = FluentSpeech(args.data_path,train=True,download=False)
-    dataset_valid = FluentSpeech(args.data_path,train="valid",download=False)
+    #dataset_valid = FluentSpeech(args.data_path,train="valid",download=False)
     dataset_test = FluentSpeech(args.data_path,train=False,download=False)
     
     
     #scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
     #scenario_valid = ClassIncremental(dataset_valid,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
-    scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
+    scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])  # ,class_order=class_order
     
     #scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len),partial(SpecAugment,F=10,T=100,double=False)])
     scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)])
@@ -214,24 +250,28 @@ def main(args):
     #scenario_test = ClassIncremental(dataset_test,nb_tasks=1,transformations=[partial(trunc, max_len=args.max_len)])
     
     
-   
+    
     
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     #criterion = torch.nn.CrossEntropyLoss()
     #criterion = bce_with_logits
     #criterion_test = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     
+    criterion_mse = torch.nn.MSELoss()
+    
+    
+    
     
     
     
    # KD DISTILLATION. 
     teacher_model = None
-    
+    past_model = None
     
     # Memory for rehearsal
     memory = None
     if args.memory_size > 0:
-        memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= 'random', fixed_memory=True, nb_total_classes=scenario_train.nb_classes)
+        memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= 'random', fixed_memory=args.fixed_memory, nb_total_classes=scenario_train.nb_classes)
         
         #memory = Memory(
         #    args.memory_size, scenario_train.nb_classes, args.rehearsal, args.fixed_memory
@@ -261,6 +301,8 @@ def main(args):
     #wandb.init(project="CL FSC (DyTox)", name="DyToxwithTCN_CL",entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
     #wandb.config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size}
     
+    global_average = []
+    
     for task_id, exp_train in enumerate(scenario_train):
         
         #concat_exps_train = torch.utils.data.ConcatDataset([exp_train,scenario_train_aug[task_id]])   # Used when we wanna merge normal and augmented datasets.
@@ -277,6 +319,11 @@ def main(args):
             teacher_model.freeze(['all'])
             teacher_model.eval()
         
+        if task_id >0:
+            past_model = copy.deepcopy(model)
+            past_model.freeze(['all'])
+            past_model.eval()
+        
         # Definition of the model Dytox: if task_id == 0, first initialization; 
         # else, the model must be updated (classifiers + task tokens).
         
@@ -289,7 +336,7 @@ def main(args):
             previous_size = len(exp_train)
             #concat_exps_train.add_samples(memory.get())   # For data aug.
             exp_train.add_samples(*memory.get())   # Standard command w/ou augment.
-            print(f"{len(exp_train) - previous_size} samples added from memory.")
+            #print(f"{len(exp_train) - previous_size} samples added from memory.")
         
         
         if task_id == 0:
@@ -367,6 +414,11 @@ def main(args):
     ###########################################################################
         print(f"Start training for {epochs} epochs")
         #max_accuracy = 0.0
+        
+        if task_id >0:
+            alpha = past_model.classif.nb_classes/model.classif.nb_classes
+        last_5_epochs = []
+        seen_classes = list(memory.seen_classes)
         for epoch in range(epochs):
             
             
@@ -375,54 +427,291 @@ def main(args):
             print(f"Epoch #: {epoch}")
             #for minibatch in range(len(train_loader)):
             for x,y,t in train_loader:
-                #x,y,t = next(iter(train_loader))
-                #x_1,y_1,t_1 = next(iter(train_loader_policy1))
-                #x_2,y_2,t_2 = next(iter(train_loader_policy2))
-                #x,y,t = torch.cat([x,x_1, x_2]), torch.cat([y,y_1, y_2]), torch.cat([t,t_1, t_2])
                 
-                x = x.to(device)
-                y = y.to(device)
-                #print(x.shape)
-                #print(y.shape)
+                
+                
+                
+                if task_id > 0:
+                    G = []
+                    model.train()
+                    for count_task in range(task_id):
+                        model.train()
+                        optimizer.zero_grad()
+                        x_ref, y_ref, _ = memory.slice(keep_tasks=[count_task])
+                        x_ref = [trunc(torch.FloatTensor(soundfile.read(p)[0]),args.max_len) for p in x_ref]
+                        x_ref = np.stack(x_ref)
+                        x_ref = torch.tensor(x_ref).to(device)
+                        y_ref = torch.tensor(y_ref).to(device)
+                        out = model(x_ref)
+                        loss = criterion(out,y_ref)
+                        loss.backward()
+                        G.append(
+                            torch.cat(
+                                [
+                                 p.grad.flatten() 
+                                 if p.grad is not None
+                                 else torch.zeros(p.numel(),device=device)
+                                 for p in model.parameters()
+                                ],
+                                dim=0,
+                            )
+                        )
+                    G = torch.stack(G)  # (experiences, parameters)
+                
+                        
+                        
                 
                 optimizer.zero_grad()
-                predict_dict = model(x)#['logits']
-                predictions = predict_dict#['logits']
                 
+                loss = 0.
                 
-                #print(predictions)
-                #print(y[:,0])
-                #print(y)
-                #print(predictions.detach().cpu().numpy().size)
-                #print(y[:,0].detach().cpu().numpy().size)
-                #print(predictions.shape)
-                #print(y.shape)
-                #print(y[:,0].shape)
-                #print(predictions[:5,:].argmax(dim=1))
-                #print(y[:5,0])
-                loss = criterion(predictions,y[:,0])  #y[:,0]
-                
-                if teacher_model is not None:
-                    with torch.no_grad():
-                        predictions_old = teacher_model(x)#['logits']
-                
-                    loss = get_kdloss(predictions,predictions_old,loss,args.distillation_tau)
+                if task_id ==0:
                     
-                # if model.head_div is not None:
-                #     total_classes = predictions.shape[1]
-                #     nb_new_classes = predict_dict['div'].shape[1] - 1
-                #     nb_old_classes = total_classes - nb_new_classes
-                #     div_targets = torch.clone(y[:,0])
-                #     mask_old_cls = div_targets < nb_old_classes
-                #     mask_new_cls = ~mask_old_cls
-                #     div_targets[mask_old_cls] = 0
-                #     div_targets[mask_new_cls] -= nb_old_classes - 1
-                #     div_loss = args.head_div_coeff * criterion(predict_dict['div'], div_targets)
-                #     loss  += div_loss
+                    x = x.to(device)
+                    y = y.to(device)
+                    predict_dict = model(x)#['logits']
+                    predictions = predict_dict#['logits']
+                    loss += criterion(predictions,y)
+                    
+                    
+                    
+                else:
+                    
+                
+                    indexes_batch = []
+                    for seen_class in seen_classes:
+                        indexes_class = np.where(y.numpy()==seen_class)[0]
+                        indexes_batch.append(indexes_class)
+                    indexes_batch = np.concatenate(indexes_batch)
+                    
+                    # MSE only rehe.
+                    if len(indexes_batch) != 0:
+                        
+                        x_memory = x[indexes_batch].to(device)
+                        
+                        current_features = model.forward_features(x_memory)
+                        past_features = past_model.forward_features(x_memory)
+                        mse_loss = math.sqrt(len(indexes_batch)/len(x))*criterion_mse(current_features,past_features)
+                        
+                        loss += mse_loss
+                    
+                    x = x.to(device)
+                    y= y.to(device)
+                    
+                    # MSE all data.
+                    
+                    # past_features = past_model.forward_features(x)
+                    # current_features = model.forward_features(x)
+                    # mse_loss = criterion_mse(current_features,past_features)
+                    # loss += np.log(1+alpha)*mse_loss
+                    
+                    mask = np.ones(len(x),dtype=bool)
+                    mask[indexes_batch] = False
+                    x_norehe = x[mask]
+                    y_norehe = y[mask]
+                    x_norehe = x_norehe.to(device)
+                    y_norehe = y_norehe.to(device)
+                    
+                    
+                    predict_dict = model(x_norehe)#['logits']
+                    predictions = predict_dict#['logits']
+                    #loss += criterion(predictions,y_norehe)*(1-np.log(1+alpha))
+                    #loss += criterion(predictions,y_norehe)*(1-math.sqrt(len(indexes_batch)/len(x)))
+                    loss += criterion(predictions,y_norehe)
+                    
+                    
+                    
+                    if past_model is not None:
+                    
+                        if len(indexes_batch) == 0:
+                            pass
+                        else:
+                            
+                            x_memory = x[indexes_batch]
+                                        
+                                
+                            current_predictions = model(x_memory)
+                            past_predictions = past_model(x_memory)
+                        
+                            kd_weight = (math.sqrt(len(indexes_batch)/len(x)))
+                        
+                            loss = get_kdloss_onlyrehe(current_predictions,past_predictions,loss,args.distillation_tau,kd_weight)
+                    
+                    
+                    if teacher_model is not None:
+                        with torch.no_grad():
+                            predictions_old = teacher_model(x)#['logits']
+                            predictions_new = model(x)
+                    
+                        loss = get_kdloss(predictions_new,predictions_old,loss,args.distillation_tau)
+                        
+                    
+                        
+                        
+                        
+                        
+                
+                # if task_id >0:
+                #     indexes_batch = []
+                #     for seen_class in seen_classes:
+                #         indexes_class = np.where(y.numpy()==seen_class)[0]
+                        
+                #         indexes_batch.append(indexes_class)
+                #     indexes_batch = np.concatenate(indexes_batch)
+                    
+                #     if len(indexes_batch) == 0:
+                #         pass
+                #     else:
+                        
+                        
+                #         x_memory = x[indexes_batch].to(device)
+                        
+                        
+                #         current_features = model.forward_features(x_memory)
+                #         past_features = past_model.forward_features(x_memory)
+                        
+                       
+                        
+                        
+                #         mse_loss = math.sqrt(len(indexes_batch)/len(x))*criterion_mse(current_features,past_features)
+                #         loss += mse_loss
+                #         #mse_loss_epoch += mse_loss.item()
+                        
+                        
+                #x = x.to(device)
+                #y = y.to(device)
+                
+                
+                
+                
+                # For MSE all data
+                
+                # if task_id > 0:
+                    
+                
+                #     past_features = past_model.forward_features(x)
+                #     current_features = model.forward_features(x)
+                #     mse_loss = criterion_mse(current_features,past_features)
+                #     #mse_loss_epoch += alpha*mse_loss.item()
+                    
+                #     predict_dict = model(x)#['logits']
+                #     predictions = predict_dict#['logits']
+                #     #loss = (1-alpha)*criterion(predictions,y) + alpha*mse_loss #y[:,0]
+                #     loss = np.log(1+alpha)*mse_loss + (1-np.log(1+alpha))*criterion(predictions,y)
+                
+                # else: 
+                #     predict_dict = model(x)#['logits']
+                #     predictions = predict_dict#['logits']
+                #     loss = criterion(predictions,y)
+                
+                # END MSE all data
+                
+                
+                
+               
+                #predict_dict = model(x)#['logits']
+                #predictions = predict_dict#['logits']
+                
+                
+                #if task_id >0:
+                #    loss += criterion(predictions,y)*(1-math.sqrt(len(indexes_batch)/len(x)))  #y[:,0]
+                    #loss += criterion(predictions,y)
+                #else:
+                #    loss += criterion(predictions,y)
+                    
+                
+                #if teacher_model is not None:
+                #    with torch.no_grad():
+                #        predictions_old = teacher_model(x)#['logits']
+                
+                #    loss = get_kdloss(predictions,predictions_old,loss,args.distillation_tau)
+                    
+                
+                # KD + MSE (indexes_batch already computed)
+                # if past_model is not None:
+                    
+                    
+                    
+                #     if len(indexes_batch) == 0:
+                #         pass
+                #     else:
+                        
+                #         x_memory = x[indexes_batch]
+                                    
+                            
+                #         current_predictions = predictions[indexes_batch]
+                #         past_predictions = past_model(x_memory)
+                    
+                #         kd_weight = (math.sqrt(len(indexes_batch)/len(x)))
+                    
+                #         loss = get_kdloss_onlyrehe(current_predictions,past_predictions,loss,args.distillation_tau,kd_weight)
+                
+                
+                
+                
+                # KD on only rehearsal data (BEGIN).
+                
+                # if past_model is not None:
+                    
+                #     indexes_batch = []
+                #     for seen_class in seen_classes:
+                #         indexes_class = np.where(y.cpu().numpy()==seen_class)[0]
+                #         indexes_batch.append(indexes_class)
+                        
+                #     indexes_batch = np.concatenate(indexes_batch)
+                    
+                #     if len(indexes_batch) == 0:
+                #         pass
+                #     else:
+                        
+                #         x_memory = x[indexes_batch]
+                                    
+                            
+                #         current_predictions = predictions[indexes_batch]
+                #         past_predictions = past_model(x_memory)
+                    
+                #         kd_weight = math.sqrt(len(indexes_batch)/len(x))
+                    
+                #         loss = get_kdloss_onlyrehe(current_predictions,past_predictions,loss,args.distillation_tau,kd_weight)
+                    
+                    
+                # KD on only rehearsal data (END). 
                 
                 
                 train_loss += loss.item()
                 loss.backward()
+                
+                
+                with torch.no_grad():
+                    if task_id > 0:
+                        g = torch.cat(
+                            [
+                             p.grad.flatten() 
+                             if p.grad is not None
+                             else torch.zeros(p.numel(),device=device)
+                             for p in model.parameters()
+                            ],
+                            dim=0,
+                        )
+                        to_project = (torch.mv(G, g) < 0).any()
+                    else:
+                        to_project = False
+                    if to_project:
+                        v_star = solve_quadprog(g,G).to(device)
+                        num_pars = 0  # reshape v_star into the parameter matrices
+                        for p in model.parameters():
+                            curr_pars = p.numel()
+                            if p.grad is not None:
+                                p.grad.copy_(
+                                    v_star[num_pars : num_pars + curr_pars].view(p.size())
+                                    )
+                            num_pars += curr_pars
+                        assert num_pars == v_star.numel(), "Error in projecting gradient"
+                        
+                
+                
+                
+                
                 optimizer.step()
                 #lr_scheduler.step(epoch)
                 
@@ -432,7 +721,10 @@ def main(args):
                 
                 #print(f"train loss for each batch: {loss.item()}")
                 #break
-                logger.add([predictions.cpu().argmax(dim=1),y[:,0].cpu(),t], subset= 'train')
+                if task_id == 0:
+                    logger.add([predictions.cpu().argmax(dim=1),y.cpu(),t], subset= 'train')
+                else:
+                    logger.add([predictions.cpu().argmax(dim=1),y_norehe.cpu(),t], subset= 'train')
                 
                 #if args.eval_every and (epoch+1) % args.eval_every == 0:
                     
@@ -460,11 +752,14 @@ def main(args):
                         predic_valid = model(x_valid.cuda())#['logits']
                         
                         
-                        test_loss += criterion(predic_valid,y_valid[:,0].cuda()).item()
+                        test_loss += criterion(predic_valid,y_valid.cuda()).item()
                         #print(predic_valid[:5,:].argmax(dim=1))
                         #print(y_valid[:5,0])
                         
-                        logger.add([predic_valid.cpu().argmax(dim=1),y_valid[:,0].cpu(),t_valid], subset = 'test')
+                        logger.add([predic_valid.cpu().argmax(dim=1),y_valid.cpu(),t_valid], subset = 'test')
+                    
+                    if epoch in [45,46,47,48,49]:
+                        last_5_epochs.append(logger.accuracy)
                     test_loss /= len(test_loader)
                     wandb.log({"train_loss": train_loss, "valid_loss": test_loss,"train_acc": logger.online_accuracy,"valid_acc": logger.accuracy })
                     print(f"Train accuracy: {logger.online_accuracy}")
@@ -482,7 +777,8 @@ def main(args):
             
             logger.end_epoch()
             
-            
+        print(f"Mean of last 5 epochs of task {task_id}: ",mean(last_5_epochs)) 
+        global_average.append(mean(last_5_epochs)) 
         if memory is not None:
             #task_memory_path = os.path.join(args.resume, f'memory_{task_id}.npz')
             #if os.path.isdir(args.resume) and os.path.exists(task_memory_path):
@@ -496,11 +792,15 @@ def main(args):
             #        memory.save(task_memory_path)
             #    else:
             #        memory.save(os.path.join(args.output_dir, f'memory_{task_id}.npz'))
-            memory.add(*scenario_train[task_id].get_raw_samples(),z=None)   # FOr normal scenario w/out augmentation.
+            #memory.add(*scenario_train[task_id].get_samples(range(len(scenario_train[task_id]))),z=None)   # FOr normal scenario w/out augmentation.
+            memory.add(*scenario_train[task_id].get_raw_samples(),z=None)
+            #memory.add(*scenario_train[task_id].get_raw_samples(),z=None)
             #concat_datasets = torch.utils.data.ConcatDataset([scenario_train[task_id],scenario_train_aug[task_id]])
             #concat_datasets = 
             #memory.add(*concat_datasets.get_raw_samples(),z=None)
+           
             print(len(memory))
+            
             
             
             assert len(memory) <= args.memory_size    
@@ -652,6 +952,9 @@ def main(args):
               
     out_file.close()            
     
+    
+    print(global_average)
+    print("Mean of tasks accuracy: ",mean(global_average))
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
