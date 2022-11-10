@@ -290,9 +290,7 @@ def main(args):
                         indexes_batch.append(indexes_class)
                     indexes_batch = np.concatenate(indexes_batch)
                     
-                    if len(indexes_batch) == 0:  # No rehe samples in the minibatch. Go on.
-                        pass
-                    else:
+                    if len(indexes_batch) != 0: 
                     
                         x_memory = x[indexes_batch].to(device)
                         
@@ -322,7 +320,7 @@ def main(args):
                 x = x.to(device)
                 y = y.to(device)
 
-                predictions = model(x)#['logits']
+                predictions = model(x)
                     
                 
                 if task_id > 0 and mse_loss: # MSE KD.
@@ -354,9 +352,7 @@ def main(args):
                                 
                         indexes_batch = np.concatenate(indexes_batch)
                     
-                    if len(indexes_batch) == 0:
-                        pass
-                    else:
+                    if len(indexes_batch) != 0:
                         
                         x_memory = x[indexes_batch].to(device)
                                     
