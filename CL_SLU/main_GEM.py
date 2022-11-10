@@ -542,9 +542,6 @@ def main(args):
     if args.use_wandb:
         wandb.finish()    
             
-            
-            
-    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser('CiCL for Spoken Language Understandig (Intent classification) on FSC: train and evaluation using GEM strategy',
