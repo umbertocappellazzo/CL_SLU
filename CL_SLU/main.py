@@ -28,7 +28,8 @@ import math
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('CiCL for Spoken Language Understandig (Intent classification) on FSC: train and evaluation', add_help=False)
+    parser = argparse.ArgumentParser('CiCL for Spoken Language Understandig (Intent classification) on FSC: train and evaluation',
+                                     add_help=False)
     
     # Dataset parameters.
     
@@ -107,7 +108,9 @@ def main(args):
     
     if args.use_wandb:
         
-        wandb.init(project=args.project_name, name=args.exp_name,entity="umbertocappellazzo",config = {"lr": args.lr, "weight_decay":args.weight_decay, "epochs":args.epochs, "batch size": args.batch_size})
+        wandb.init(project=args.project_name, name=args.exp_name,entity="umbertocappellazzo",
+                   config = {"lr": args.lr, "weight_decay":args.weight_decay, 
+                   "epochs":args.epochs, "batch size": args.batch_size})
     
     print(args)
     
@@ -150,8 +153,10 @@ def main(args):
         
     else:
         
-        scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
-        scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
+        scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,
+                                          transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
+        scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,
+                                         transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
     
     # Losses employed: CE + MSE.
     
@@ -169,7 +174,8 @@ def main(args):
     
     memory = None
     if args.memory_size > 0:
-        memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= args.herding, fixed_memory=args.fixed_memory, nb_total_classes=scenario_train.nb_classes)
+        memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= args.herding, 
+                                           fixed_memory=args.fixed_memory, nb_total_classes=scenario_train.nb_classes)
         
     
     
@@ -232,8 +238,10 @@ def main(args):
         
         test_taskset = scenario_test[:task_id+1]    # Evaluation on all seen tasks.
         
-        train_loader = DataLoader(exp_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,pin_memory=True, drop_last=False)
-        test_loader = DataLoader(test_taskset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
+        train_loader = DataLoader(exp_train, batch_size=args.batch_size, shuffle=True, 
+                                  num_workers=args.num_workers,pin_memory=True, drop_last=False)
+        test_loader = DataLoader(test_taskset, batch_size=args.batch_size, shuffle=False, 
+                                 num_workers=args.num_workers, pin_memory=True, drop_last=False)
        
         
     ###########################################################################
@@ -335,7 +343,8 @@ def main(args):
                 
                 if task_id > 0 and preds_space_kd == 'only_rehe':
                     
-                    if not use_both_kds:   # Find the rehe samples among the training batch. When we use both KDs, this operation has been already performed.
+                    if not use_both_kds:   # Find the rehe samples among the training batch. When we use both KDs, 
+                                           # this operation has been already performed.
                         
                         indexes_batch = []
                         for seen_class in seen_classes:
@@ -356,7 +365,8 @@ def main(args):
                     
                         kd_weight = math.sqrt(len(indexes_batch)/len(x))
                     
-                        loss = get_kdloss_onlyrehe(current_predictions,past_predictions,loss,args.distillation_tau,kd_weight,use_both_kds)
+                        loss = get_kdloss_onlyrehe(current_predictions,past_predictions,loss,
+                                                   args.distillation_tau,kd_weight,use_both_kds)
                 
                 
                 
@@ -385,7 +395,8 @@ def main(args):
                         last_5_epochs.append(logger.accuracy)
                     test_loss /= len(test_loader)
                     if args.use_wandb:
-                        wandb.log({"train_loss": train_loss, "valid_loss": test_loss,"train_acc": logger.online_accuracy,"valid_acc": logger.accuracy })
+                        wandb.log({"train_loss": train_loss, "valid_loss": test_loss,"train_acc": 
+                                   logger.online_accuracy,"valid_acc": logger.accuracy })
                     
                     print(f"Train accuracy: {logger.online_accuracy}")
                     print(f"Valid accuracy: {logger.accuracy}")
@@ -396,8 +407,9 @@ def main(args):
             json.dump({"task": task_id, "epoch": epoch,
                         "valid_acc": round(100*logger.accuracy,2), "train_acc": round(100*logger.online_accuracy,2),
                         "avg_acc": round(100 * logger.average_incremental_accuracy, 2),"online_cum_perf": round(100*logger.online_cumulative_performance,2),
-                        'acc_per_task': [round(100 * acc_t, 2) for acc_t in logger.accuracy_per_task], 'bwt': round(100 * logger.backward_transfer, 2),'forgetting': round(100 * logger.forgetting, 6),
-                        'train_loss': round(train_loss, 5), 'valid_loss': round(test_loss, 5)}, out_file,ensure_ascii = False )
+                        'acc_per_task': [round(100 * acc_t, 2) for acc_t in logger.accuracy_per_task], 'bwt': round(100 * logger.backward_transfer, 2),
+                        'forgetting': round(100 * logger.forgetting, 6),'train_loss': round(train_loss, 5), 
+                        'valid_loss': round(test_loss, 5)}, out_file,ensure_ascii = False )
             
             out_file.write('\n')
             logger.end_epoch()
@@ -414,7 +426,8 @@ def main(args):
             
             else:
             
-                loader = DataLoader(scenario_train[task_id], batch_size=args.batch_size,shuffle=False, num_workers=2,pin_memory=True, drop_last=False)
+                loader = DataLoader(scenario_train[task_id], batch_size=args.batch_size,shuffle=False, 
+                                    num_workers=2,pin_memory=True, drop_last=False)
                 
                 features, targets = [], []
                 
@@ -455,7 +468,8 @@ def main(args):
             
             
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser('CiCL for Spoken Language Understandig (Intent classification) on FSC: train and evaluation', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('CiCL for Spoken Language Understandig (Intent classification) on FSC: train and evaluation',
+                                     parents=[get_args_parser()])
     args = parser.parse_args()
 
     main(args)
