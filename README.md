@@ -1,9 +1,9 @@
 # Exploring the Joint Use of Rehearsal and Knowledge Distillation in Continual Learning for Spoken Language Understanding
-This codebase contains the implementation of the experiments on the efficacy of combining rehearsal and knowledge distillation (KD) techniques applied to a Class-Incremental Continual Learning (CiCL) scenario for the Spoken Language Understanding task. This is the official code implementation of a paper submitted to ICASSP 2023.
+This codebase contains the implementation of the experiments on the efficacy of combining rehearsal and knowledge distillation (KD) techniques applied to a Class-Incremental Continual Learning (CiCL) scenario for the Spoken Language Understanding task. This is the official code implementation of the homologous paper submitted to ICASSP 2023.
 
 ## General overview
 
-We explore a CiCL scenario for SLU, specifically for Intent Classification. The dataset used for the experiments is Fluent Speech Commands [[1]](#1). We consider multiple KD combinations at different levels in the network (i.e., feature and predictions space), as well as exploiting only rehearsal data or their combination with the current task data. The results supports the effectiveness of concurrently exerting predictions space and feature space KDs. Additionally, our method is expecially suitable for low-resource devices in that it attains larger gains for smaller rehearsal buffer's sizes.
+We explore a CiCL scenario for SLU, specifically for Intent Classification. The dataset used for the experiments is Fluent Speech Commands [[1]](#1). We consider multiple KD combinations at different levels in the network (i.e., feature and predictions space), applied to only rehearsal data or their combination with the current task data. The experimental results support the effectiveness of concurrently exerting predictions space and feature space KDs. Additionally, our method is expecially suitable for low-resource devices in that it attains larger gains for smaller rehearsal buffer's sizes.
 
 ![main figure](CL_SLU_scheme.png)
 
@@ -20,11 +20,10 @@ I used weights and biases (https://wandb.ai/site) for tracking my experiments (I
 ## Running an experiment
 If you want to run the experiments using iCaRL [[2]](#2), random, or closest_to_mean as rehearsal strategy, you need to use `main.py`. For GEM [[3]](#3), use `main_GEM.py`.  
 
+The standard CiCL encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For the first run remember to add `--download_dataset` if you want to download the FSC dataset. 
 
-An experiment is defined by whether the KD is applied or not, either in the feature space or in the predictions space. Plus, you need to decide whether to use only the rehearsal data or their combination with the data from the current task. You can choose the desired experiment by setting the value for `feat_space_kd` and `preds_space_kd`. Each parameter can take three values: `'None'`, `'only_rehe'`, and `'all'`.  
 
-
-The standard CiCL encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For all the other parameters, please to the code and/or paper. For the first run remember to add `--download_dataset` if you want to download the FSC dataset. 
+An experiment is defined by whether the KD is applied or not, either in the feature space or in the predictions space. Plus, you need to decide whether to use only the rehearsal data or their combination with the data from the current task. You can choose the desired experiment by setting the value for `feat_space_kd` and `preds_space_kd`. Each parameter can take three values: `'None'`, `'only_rehe'`, and `'all'`. For all the other parameters (training, TCN enc, etc.), please refer to the code and/or paper.  
 
 
 Suppose we want to run an experiment using iCaRL as rehearsal strategy with buffer size equal to 930, and we apply the KD in the feature space to only the rehearsal samples, whereas the KD in the predictions space uses both current and rehe data. Then the command to run is: 
