@@ -36,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--data_path', type=str, default='/data/cappellazzo/CL_SLU/',help='path to dataset')
     parser.add_argument('--max_len', type=int, default=64000, 
                         help='max length for the audio signal --> it will be cut')
-    parser.add_argument('--download_dataset', default=False, 
+    parser.add_argument('--download_dataset', default=False, action='store_true',
                         help='whether to download the FSC dataset or not')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type= str, default='cuda', 
@@ -105,7 +105,7 @@ def get_args_parser():
     
     # WANDB parameters.
     
-    parser.add_argument('--use_wandb', type=bool, default=True, 
+    parser.add_argument('--use_wandb', type=bool, default=True, action='store_false',
                         help='whether to track experiments with wandb')
     parser.add_argument('--project_name', type=str, default='ICASSP_paper_experiments')
     parser.add_argument('--exp_name', type=str, default='prova')

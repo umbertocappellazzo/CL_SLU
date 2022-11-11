@@ -108,7 +108,7 @@ def get_args_parser():
     
     # WANDB parameters.
     
-    parser.add_argument('--use_wandb', type=bool, default=True, 
+    parser.add_argument('--use_wandb', type=bool, default=True, action='store_false',
                         help='whether to track experiments with wandb')
     parser.add_argument('--project_name', type=str, default='ICASSP_paper_experiments')
     parser.add_argument('--exp_name', type=str, default='prova')
