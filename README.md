@@ -18,22 +18,33 @@ pip install -r requirements.txt
 I used weights and biases (https://wandb.ai/site) for tracking my experiments (I warmly recommend it). Nonetheless, you can deactivate it by setting `use_wandb` to False.
 
 ## Running an experiment
-If you want to run the experiments using iCaRL, random, or closest_to_mean as rehearsal strategy, you need to use `main.py`. For GEM, use `main_GEM.py`.  
+If you want to run the experiments using iCaRL [[2]](#2), random, or closest_to_mean as rehearsal strategy, you need to use `main.py`. For GEM [[3]](#3), use `main_GEM.py`.  
 
 
 An experiment is defined by whether the KD is applied or not, either in the feature space or in the predictions space. Plus, you need to decide whether to use only the rehearsal data or their combination with the data from the current task. You can choose the desired experiment by setting the value for `feat_space_kd` and `preds_space_kd`. Each parameter can take three values: `'None'`, `'only_rehe'`, and `'all'`.  
 
 
-The standard CiCL encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For all the other parameters, please to the code and/or paper.
+The standard CiCL encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For all the other parameters, please to the code and/or paper. For the first run remember to add `--download_dataset` if you want to download the FSC dataset. 
 
 
 Suppose we want to run an experiment using iCaRL as rehearsal strategy with buffer size equal to 930, and we apply the KD in the feature space to only the rehearsal samples, whereas the KD in the predictions space uses both current and rehe data. Then the command to run is: 
 
 ```
-python 
+python main.py --data_path MY_PATH_TO_DATASET --memory_size 930 --herding barycenter --feat_space_kd only_rehe --preds_space_kd all 
 ```
 
+If you'd like to run the offline baseline (i.e., no CL --> 1 single taks with all 31 intents):
+
+```
+python main.py --data_path MY_PATH_TO_DATASET --offline_train 
+```
 
 ## References
 <a id="1">[1]</a> 
-L. Lugosch, M. Ravanelli, P. Ignoto, V. S. Tomar, and Y. Bengio, *Speech model pre-training for end-to-end spoken language understanding*, Interspeech 2019, 2019.
+L. Lugosch, M. Ravanelli, P. Ignoto, V. S. Tomar, and Y. Bengio, *"Speech model pre-training for end-to-end spoken language understanding"*, Interspeech 2019, 2019.
+
+<a id="2">[2]</a>
+Z. Li and D. Hoiem, *"Learning without forgetting”*, IEEE transactions on pattern analysis and machine intelligence, 2017.
+
+<a id="3">[3]</a>
+D.Lopez-Paz and M.Ranzato, *“Gradient episodic memory for continual learning”*, NeurIPS, 2017.
