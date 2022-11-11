@@ -57,6 +57,19 @@ def get_args_parser():
     parser.add_argument('--weight_decay', type=float, default=0.)
     
     
+    # Encoder (TCN) hyperparameters.
+    
+    parser.add_argument('--in_chan', type=int, default=40,
+                        help='Number of input channels')
+    parser.add_argument('--out_chan', type=int, default=64,
+                        help='Number of output channels')
+    parser.add_argument('--hid_chan', type=int, default=128,
+                        help='Number of hidden channels in the depth-wise convolution')
+    parser.add_argument('--kernel_size', type=int, default=3,)
+    parser.add_argument('--n_blocks', type=int, default=5,)
+    parser.add_argument('--n_repeats', type=int, default=2,)
+    
+    
     # Rehearsal memory.
     
     parser.add_argument('--memory_size', default=0, type=int,
@@ -222,7 +235,10 @@ def main(args):
         if task_id == 0:
             
             print('Creating the CL model:')
-            model = CL_model(initial_classes,device=device).to(device)     
+            model = CL_model(initial_classes,in_chan=args.in_chan, n_blocks=args.n_blocks, n_repeats=args.n_repeats,
+                             out_chan=args.out_chan, hid_chan=args.hid_chan,kernel_size=args.kernel_size,
+                             device=device).to(device)     
+            
             n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print('Number of params of the model:', n_parameters)
             
