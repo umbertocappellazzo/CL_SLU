@@ -98,7 +98,7 @@ def get_args_parser():
                         help='# of classes for the 1st task/experience')
     parser.add_argument('--nb_tasks', type=int, default=10, 
                         help='the scenario number of tasks')
-    parser.add_argument('--offline_train', type=bool, default=True, 
+    parser.add_argument('--offline_train', type=bool, default=False, action='store_true',
                         help='whether to train in an offline fashion (i.e., no CL setting)')
     parser.add_argument('--total_classes', type=int, default= 31, 
                         help='The total number of classes when we train in an offline i.i.d. fashion. Set to None otherwise.')

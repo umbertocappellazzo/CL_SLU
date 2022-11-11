@@ -77,7 +77,7 @@ def get_args_parser():
     
     parser.add_argument('--memory_size', default=930, type=int,
                         help='Total memory size in number of stored samples.')
-    parser.add_argument('--fixed_memory', default=True, action='store_true',
+    parser.add_argument('--fixed_memory', default=True,
                         help='Dont fully use memory when no all classes are seen')
     parser.add_argument('--herding', default="random",
                         choices=[
@@ -101,7 +101,7 @@ def get_args_parser():
                         help='# of classes for the 1st task/experience')
     parser.add_argument('--nb_tasks', type=int, default=10, 
                         help='the scenario number of tasks')
-    parser.add_argument('--offline_train', type=bool, default=False, 
+    parser.add_argument('--offline_train', type=bool, default=False, action='store_true',
                         help='whether to train in an offline fashion (i.e., no CL setting)')
     parser.add_argument('--total_classes', type=int, default= 31, 
                         help='The total number of classes when we train in an offline i.i.d. fashion. Set to None otherwise.')
