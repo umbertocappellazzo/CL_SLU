@@ -15,7 +15,7 @@ The requested libraries for running the experiments are listed in the requiremen
 pip install -r requirements.txt
 ```
 
-I used weights and biases (https://wandb.ai/site) for tracking my experiments (I warmly recommend it). Nonetheless, you can deactivate it by setting `use_wandb` to False.
+I used weights and biases (https://wandb.ai/site) for tracking my experiments (I warmly recommend it). Nonetheless, you can deactivate it by adding `--use_wandb` in the command line.
 
 ## Running an experiment
 If you want to run the experiments using iCaRL [[2]](#2), random, or closest_to_mean as rehearsal strategy, you need to use `main.py`. For GEM [[3]](#3), use `main_GEM.py`.  
