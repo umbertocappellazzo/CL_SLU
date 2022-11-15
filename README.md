@@ -9,7 +9,7 @@ We explore a CiCL scenario for SLU, specifically for Intent Classification. The 
 
 ## Environment setup
 The requested libraries for running the experiments are listed in the requirements.txt file. Run the command below to install them.  
-**NOTA BENE**: for the experiments the forked continuum library must be used (https://github.com/umbertocappellazzo/continuum.git).  
+**N.B.**: for the experiments the forked continuum library must be used (https://github.com/umbertocappellazzo/continuum.git).  
 
 ```
 pip install -r requirements.txt
