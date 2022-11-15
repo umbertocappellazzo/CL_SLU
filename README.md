@@ -20,7 +20,7 @@ I used weights and biases (https://wandb.ai/site) for tracking my experiments (I
 ## Running an experiment
 If you want to run the experiments using iCaRL [[2]](#2), random, or closest_to_mean as rehearsal strategy, you need to use `main.py`. For GEM [[3]](#3), use `main_GEM.py`.  
 
-The standard CiCL encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For the first run remember to add `--download_dataset` if you want to download the FSC dataset. 
+The standard CiCL scenario encompasses 10 tasks overall, each of them comprising 3 intents/classes (except the first task that has 4 intents). For the first run remember to add `--download_dataset` if you want to download the FSC dataset. 
 
 
 An experiment is defined by whether the KD is applied or not, either in the feature space or in the predictions space. Plus, you need to decide whether to use only the rehearsal data or their combination with the data from the current task. You can choose the desired experiment by setting the value for `feat_space_kd` and `preds_space_kd`. Each parameter can take three values: `'None'`, `'only_rehe'`, and `'all'`. For all the other parameters (training, TCN enc, etc.), please refer to the code and/or paper.  
@@ -32,7 +32,7 @@ Suppose we want to run an experiment using iCaRL as rehearsal strategy with buff
 python main.py --data_path MY_PATH_TO_DATASET --memory_size 930 --herding barycenter --feat_space_kd only_rehe --preds_space_kd all 
 ```
 
-If you'd like to run the offline baseline (i.e., no CL --> 1 single taks with all 31 intents):
+If you'd like to run the offline baseline (i.e., no CL --> 1 single task with all 31 intents):
 
 ```
 python main.py --data_path MY_PATH_TO_DATASET --offline_train 
