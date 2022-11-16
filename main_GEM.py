@@ -39,7 +39,7 @@ def get_args_parser():
     parser.add_argument('--data_path', type=str, default='/data/cappellazzo/CL_SLU/',help='path to dataset')
     parser.add_argument('--max_len', type=int, default=64000, 
                         help='max length for the audio signal --> it will be cut')
-    parser.add_argument('--download_dataset', default=False, 
+    parser.add_argument('--download_dataset', default=False, action='store_true',
                         help='whether to download the FSC dataset or not')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type= str, default='cuda', 
@@ -101,14 +101,10 @@ def get_args_parser():
                         help='# of classes for the 1st task/experience')
     parser.add_argument('--nb_tasks', type=int, default=10, 
                         help='the scenario number of tasks')
-    parser.add_argument('--offline_train', type=bool, default=False, action='store_true',
-                        help='whether to train in an offline fashion (i.e., no CL setting)')
-    parser.add_argument('--total_classes', type=int, default= 31, 
-                        help='The total number of classes when we train in an offline i.i.d. fashion. Set to None otherwise.')
     
     # WANDB parameters.
     
-    parser.add_argument('--use_wandb', type=bool, default=True, action='store_false',
+    parser.add_argument('--use_wandb', default=True, action='store_false',
                         help='whether to track experiments with wandb')
     parser.add_argument('--project_name', type=str, default='ICASSP_paper_experiments')
     parser.add_argument('--exp_name', type=str, default='prova')
@@ -187,17 +183,12 @@ def main(args):
     
     
     
-    if args.offline_train:   # Create just 1 task with all classes.
-       
-        scenario_train = ClassIncremental(dataset_train,nb_tasks=1,transformations=[partial(trunc, max_len=args.max_len)])
-        scenario_test = ClassIncremental(dataset_test,nb_tasks=1,transformations=[partial(trunc, max_len=args.max_len)])
-        
-    else:
-        
-        scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,
-                                          transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
-        scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,
-                                         transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
+    
+    
+    scenario_train = ClassIncremental(dataset_train,increment=args.increment,initial_increment=args.initial_increment,
+                                      transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
+    scenario_test = ClassIncremental(dataset_test,increment=args.increment,initial_increment=args.initial_increment,
+                                     transformations=[partial(trunc, max_len=args.max_len)],class_order=class_order)
     
     # Losses employed: CE + MSE.
     
@@ -218,11 +209,9 @@ def main(args):
         memory = rehearsal.RehearsalMemory(args.memory_size, herding_method= args.herding, 
                                            fixed_memory=args.fixed_memory, nb_total_classes=scenario_train.nb_classes)
         
+
     
-    
-    # Use all the classes for offline training.
-    
-    initial_classes = args.total_classes if args.offline_train else args.initial_increment
+    initial_classes = args.initial_increment
     
     
     start_time = time.time()
@@ -394,6 +383,8 @@ def main(args):
                     x = x.to(device)
                     y = y.to(device)
                     
+                    # Each batch contains the current data + rehe data. However, GEM doesn't interleave 
+                    # current and rehe data. Thus, we need to get the current-task data.
                     
                     mask = np.ones(len(x),dtype=bool)
                     mask[indexes_batch] = False
