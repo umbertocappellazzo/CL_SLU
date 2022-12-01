@@ -288,7 +288,7 @@ def main(args):
            
             for x,y,t in train_loader:
                 
-                print(x.shape)
+                
                 optimizer.zero_grad()
                 
                 
@@ -338,7 +338,7 @@ def main(args):
                 y = y.to(device)
 
                 predictions = model(x)
-                print(predictions.shape)
+                
                     
                 
                 if task_id > 0 and mse_loss: # MSE KD.
