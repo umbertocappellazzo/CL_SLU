@@ -129,7 +129,7 @@ class TCN(nn.Module):
             
            residual = self.TCN[i](output)
            output = output + residual
-
+        
         output = output.mean(-1)   # MAX pooling
         
         return output

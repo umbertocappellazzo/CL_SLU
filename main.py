@@ -72,7 +72,7 @@ def get_args_parser():
     
     # Rehearsal memory.
     
-    parser.add_argument('--memory_size', default=0, type=int,
+    parser.add_argument('--memory_size', default=930, type=int,
                         help='Total memory size in number of stored samples.')
     parser.add_argument('--fixed_memory', default=True,
                         help='Dont fully use memory when no all classes are seen')
@@ -87,8 +87,8 @@ def get_args_parser():
     
     parser.add_argument('--distillation-tau', default=1.0, type=float,
                         help='Temperature for the KD')
-    parser.add_argument('--feat_space_kd', default='None', choices=[None,'only_rehe','all'])
-    parser.add_argument('--preds_space_kd', default='None', choices=[None,'only_rehe','all'])
+    parser.add_argument('--feat_space_kd', default='only_rehe', choices=[None,'only_rehe','all'])
+    parser.add_argument('--preds_space_kd', default='all', choices=[None,'only_rehe','all'])
     
     # Continual learning parameters.
     
@@ -105,7 +105,7 @@ def get_args_parser():
     
     # WANDB parameters.
     
-    parser.add_argument('--use_wandb', default=True, action='store_false',
+    parser.add_argument('--use_wandb', default=False, action='store_false',
                         help='whether to track experiments with wandb')
     parser.add_argument('--project_name', type=str, default='ICASSP_paper_experiments')
     parser.add_argument('--exp_name', type=str, default='prova')
@@ -288,6 +288,7 @@ def main(args):
            
             for x,y,t in train_loader:
                 
+                print(x.shape)
                 optimizer.zero_grad()
                 
                 
@@ -337,6 +338,7 @@ def main(args):
                 y = y.to(device)
 
                 predictions = model(x)
+                print(predictions.shape)
                     
                 
                 if task_id > 0 and mse_loss: # MSE KD.
