@@ -1,4 +1,4 @@
-# Exploring the Joint Use of Rehearsal and Knowledge Distillation in Continual Learning for Spoken Language Understanding
+# An Investigation of the Combination of Rehearsal and Knowledge Distillation in Continual Learning for Spoken Language Understanding
 This codebase contains the implementation of the experiments on the efficacy of combining rehearsal and knowledge distillation (KD) techniques applied to a Class-Incremental Continual Learning (CiCL) scenario for the Spoken Language Understanding task. This is the official code implementation of the homologous paper accepted at INTERSPEECH 2023.
 
 ## General overview
